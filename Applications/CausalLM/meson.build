@@ -75,6 +75,18 @@ e = executable('nntr_causallm',
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
 
+
+quantize_src = [
+    meson.current_source_dir() / 'quantize.cpp',
+]
+
+e_quantize = executable('nntr_quantize',
+    quantize_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+
 test_api_src = [
     meson.current_source_dir() / 'api' / 'test_api.cpp',
 ]

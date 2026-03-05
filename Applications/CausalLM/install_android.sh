@@ -150,8 +150,8 @@ adb shell "mkdir -p $INSTALL_DIR"
 adb shell "mkdir -p $MODEL_DIR"
 log_success "Directories created"
 
-# Push executable
-log_info "Pushing executable..."
+# Push executables
+log_info "Pushing executables..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm" "$INSTALL_DIR/" 2>&1 | tail -1
 adb shell "chmod 755 $INSTALL_DIR/nntrainer_causallm"
 log_success "nntrainer_causallm pushed"
@@ -162,6 +162,12 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" "$INSTALL_DIR/" 2>&1 | tail -1
     adb shell "chmod 755 $INSTALL_DIR/test_api"
     log_success "test_api pushed"
+fi
+
+if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
+    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" $INSTALL_DIR/
+    adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+    log_success "nntr_quantize installed."
 fi
 
 # Push shared libraries
@@ -206,6 +212,16 @@ EOF
 "
 adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
 
+# Create quantize run script on device
+adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+cd $INSTALL_DIR
+./nntr_quantize \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
+
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
@@ -245,6 +261,9 @@ log_info "  1. Push your model files to: $MODEL_DIR/"
 log_info "      Example: adb push res/qwen3/qwen3-4b $MODEL_DIR/qwen3-4b/"
 log_info "2. Run the application:"
 log_info "   adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-4b"
+log_info ""
+log_info "(optional) Run quantization:"
+log_info "  adb shell $INSTALL_DIR/run_quantize.sh $MODEL_DIR/qwen3-4b --fc_dtype Q4_0"
 log_info ""
 log_info "For interactive shell:"
 log_info "   adb shell"
