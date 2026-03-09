@@ -210,7 +210,7 @@ void EmbeddingLayer::save(std::ofstream &file,
             nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                            {nntrainer::Tformat::NCHW, dtype});
             nntrainer::quantize_q4_0(weight.getData<float>(),
-                                     quant_weight.getData<uint8_t>(), N, K,
+                                     quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
           }
@@ -222,7 +222,7 @@ void EmbeddingLayer::save(std::ofstream &file,
           nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                          {nntrainer::Tformat::NCHW, dtype});
           nntrainer::quantize_q6_K(weight.getData<float>(),
-                                   quant_weight.getData<uint8_t>(), N, K,
+                                   quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(file);
         } else {

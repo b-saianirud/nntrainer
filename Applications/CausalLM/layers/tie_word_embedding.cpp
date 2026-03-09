@@ -412,7 +412,7 @@ void TieWordEmbedding::save(std::ofstream &file,
                                            {nntrainer::Tformat::NCHW, dtype});
 
             nntrainer::quantize_q6_K(weight.getData<float>(),
-                                     quant_weight.getData<uint8_t>(), N, K,
+                                     quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
           } else {
