@@ -186,7 +186,7 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
 LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
-    ../models/embedding.cpp \
+    ../models/sentence_transformer.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
     ../models/qwen3/qwen3_causallm.cpp \
