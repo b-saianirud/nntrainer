@@ -64,6 +64,7 @@ log_step "2/3" "Check build artifacts"
 REQUIRED_FILES=(
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize"
 )
 
 # Optional dependency files (might not be in libs/arm64-v8a depending on build)
@@ -164,11 +165,11 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     log_success "test_api pushed"
 fi
 
-if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" ]; then
-    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" $INSTALL_DIR/
-    adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
-    log_success "nntr_quantize installed."
-fi
+
+log_info "Pushing nntr_quantize..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+log_success "nntr_quantize pushed"
 
 # Push shared libraries
 log_info "Pushing shared libraries..."

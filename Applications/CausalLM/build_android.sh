@@ -152,9 +152,9 @@ cd "$SCRIPT_DIR/jni"
 # Clean previous builds
 rm -rf libs obj
 
-log_info "Building with ndk-build (builds causallm_core and nntrainer_causallm)..."
+log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize)..."
 # We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm -j $(nproc); then
+if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"
@@ -166,6 +166,7 @@ log_info "Build artifacts:"
 
 check_artifact "libcausallm_core.so" || exit 1
 check_artifact "nntrainer_causallm" || exit 1
+check_artifact "nntr_quantize" || exit 1
 
 # Summary
 log_header "Build Summary"
