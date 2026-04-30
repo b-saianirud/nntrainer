@@ -21,7 +21,7 @@
  *
  */
 
-#include "nntrainer_test_util.h"
+#include <nntrainer_test_util.h>
 #include <app_context.h>
 #include <climits>
 #include <filesystem>
@@ -33,6 +33,7 @@
 #include <random>
 #include <regex>
 #include <tensor.h>
+#include <quantizer.h>
 
 #define num_class 10
 #define batch_size 16
@@ -293,9 +294,20 @@ nntrainer::GraphRepresentation makeCompiledGraph(
 void sizeCheckedReadTensor(nntrainer::Tensor &t, std::ifstream &file,
                            const std::string &error_msg) {
   unsigned int sz = 0;
+  bool is_q4 = false;
 
-  if (t.getDataType() == ml::train::TensorDim::DataType::FP32) {
+  std::cerr << "[TENSOR_DBG] reading: " << error_msg
+            << " type=" << (int)t.getDataType()
+            << " dim=" << t.getDim().batch() << "x" << t.getDim().channel()
+            << "x" << t.getDim().height() << "x" << t.getDim().width()
+            << " dataLen=" << t.getDim().getDataLen() << std::endl;
+
+  if (t.getDataType() == ml::train::TensorDim::DataType::FP32 || 
+      t.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
     nntrainer::checkedRead(file, (char *)&sz, sizeof(unsigned));
+    if (t.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+        is_q4 = true;
+    }
   } else if (t.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     // This needs to be fixed. sz is always unsinged int type.
@@ -305,8 +317,33 @@ void sizeCheckedReadTensor(nntrainer::Tensor &t, std::ifstream &file,
 #endif
   }
 
+  std::cerr << "[TENSOR_DBG] sz=" << sz << " is_q4=" << is_q4 << std::endl;
+
+  if (is_q4) {
+      unsigned int padded_total = t.getDim().getDataLen();
+
+      if (padded_total == sz) {
+        nntrainer::TensorDim fp32_dim = t.getDim();
+        fp32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+        nntrainer::Tensor fp32_temp(fp32_dim, true, nntrainer::Initializer::NONE, "");
+        fp32_temp.read(file);
+        std::cerr << "[Q4_DBG] read padded FP32 OK, calling quantize..." << std::endl;
+
+        nntrainer::GgmlQuantizer quantizer(nntrainer::QScheme::Q4_0);
+        nntrainer::Tensor q4_result = quantizer.quantize(fp32_temp, ml::train::TensorDim::DataType::Q4_0);
+        std::cerr << "[Q4_DBG] quantize done, t.size=" << t.size()
+                  << " q4.size=" << q4_result.size() << std::endl;
+        std::memcpy(t.getData<uint8_t>(), q4_result.getData<uint8_t>(), q4_result.size());
+        std::cerr << "[Q4_DBG] memcpy done, returning" << std::endl;
+        return;
+      }
+      // Bias or unpadded tensor — fall through to normal FP32 read
+      std::cerr << "[Q4_DBG] fallthrough (bias or unpadded)" << std::endl;
+  }
+
   NNTR_THROW_IF(t.getDim().getDataLen() != sz, std::invalid_argument)
     << "[ReadFail] dimension does not match at " << error_msg << " sz: " << sz
     << " dimsize: " << t.getDim().getDataLen() << '\n';
   t.read(file);
+  std::cerr << "[TENSOR_DBG] read OK: " << error_msg << std::endl;
 }

@@ -290,6 +290,7 @@ static void im2col(const Tensor &in, const TensorDim &kdim,
 } // namespace
 
 enum ConvParams { weight, bias };
+enum ConvTensors { result_padded, tmp_out_padded };
 
 Conv2DLayer::Conv2DLayer(
   const std::array<unsigned int, CONV2D_DIM * 2> &padding_) :
@@ -299,6 +300,7 @@ Conv2DLayer::Conv2DLayer(
              std::array<props::Stride, CONV2D_DIM>(), props::Padding2D(),
              std::array<props::Dilation, CONV2D_DIM>()) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
+  tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void Conv2DLayer::finalize(InitLayerContext &context) {
@@ -328,17 +330,33 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   auto in_t_type = in_dim.getTensorType();
   in_t_type.data_type = context.getWeightDataType();
 
-  TensorDim kernel_dim = TensorDim(filter_size, in_dim.channel(),
-                                   kernel_size[0], kernel_size[1], in_t_type);
+  // Logical kernel dim is always the original shape — used for padding and
+  // output size computation.
+  TensorDim logical_kernel_dim(filter_size, in_dim.channel(),
+                               kernel_size[0], kernel_size[1], in_t_type);
 
-  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, in_t_type);
+  // Storage kernel dim may differ for quantized types that need alignment.
+  TensorDim storage_kernel_dim;
+  if (in_t_type.data_type == ml::train::TensorDim::DataType::Q4_0) {
+    unsigned int N = filter_size;
+    unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
+    unsigned int padded_N = ((N + 31) / 32) * 32;
+    unsigned int padded_K = ((K + 31) / 32) * 32;
+    storage_kernel_dim = TensorDim(1, 1, padded_K, padded_N, in_t_type);
+  } else {
+    storage_kernel_dim = logical_kernel_dim;
+  }
+
+  auto bias_t_type = in_t_type;
+  bias_t_type.data_type = ml::train::TensorDim::DataType::FP32;
+  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, bias_t_type);
 
   padding = std::get<props::Padding2D>(conv_props)
-              .compute(in_dim, kernel_dim, {stride[0], stride[1]},
+              .compute(in_dim, logical_kernel_dim, {stride[0], stride[1]},
                        {dilation[0], dilation[1]});
 
   wt_idx[ConvParams::weight] = context.requestWeight(
-    kernel_dim, weight_initializer, weight_regularizer,
+    storage_kernel_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "filter", true, 0);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
@@ -375,6 +393,21 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
                   eff_in_width - padding[2] - kernel_size[1] > IM,
                 std::invalid_argument)
     << "Failed to initialize: Calculated patch end is over int max";
+
+  if (in_t_type.data_type == ml::train::TensorDim::DataType::Q4_0) {
+    unsigned int N = filter_size;
+    unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
+    unsigned int padded_N = ((N + 31) / 32) * 32;
+    unsigned int padded_K = ((K + 31) / 32) * 32;
+
+    if (padded_K != K) {
+      tensor_idx[ConvTensors::result_padded] = context.requestTensor(
+        TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_K, in_dim.getTensorType()), "result_padded");
+    }
+    
+    tensor_idx[ConvTensors::tmp_out_padded] = context.requestTensor(
+      TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_N, out_dim.getTensorType()), "tmp_out_padded");
+  }
 }
 
 void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
@@ -429,12 +462,19 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   const TensorDim &in_dim = input_.getDim();
   const TensorDim &out_dim = hidden_.getDim();
   const TensorDim &filter_dim = filter_kernel.getDim();
-  TensorDim filter_dim_squeezed{filter_kernel.batch(),
-                                filter_kernel.getDim().getFeatureLen()};
+  auto &kernel_size = std::get<std::array<props::KernelSize, CONV2D_DIM>>(conv_props);
+  auto original_filter_type = filter_kernel.getTensorType();
+  original_filter_type.data_type = ml::train::TensorDim::DataType::FP32;
+  TensorDim original_filter_dim(filter_size, in_dim.channel(), kernel_size[0], kernel_size[1], original_filter_type);
 
-  filter_dim_squeezed.setTensorType(filter_kernel.getTensorType());
+  if (filter_kernel.getDataType() != ml::train::TensorDim::DataType::Q4_0) {
+    TensorDim filter_dim_squeezed{filter_kernel.batch(),
+                                  filter_kernel.getDim().getFeatureLen()};
 
-  filter_kernel.reshape(filter_dim_squeezed);
+    filter_dim_squeezed.setTensorType(filter_kernel.getTensorType());
+
+    filter_kernel.reshape(filter_dim_squeezed);
+  }
 
   /**
    * Below sets the pad area values to zero
@@ -442,16 +482,63 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
    */
   auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
                             void *user_data) {
-    Tensor result = Tensor(calcCol2ImOutputDim(out_dim, filter_dim));
+    Tensor result = Tensor(calcCol2ImOutputDim(out_dim, original_filter_dim));
     result.setZero();
     for (unsigned int b = s; b < e; ++b) {
       Tensor out = hidden_.getBatchSlice(b, 1);
       out.reshape({filter_size, out_dim.width() * out_dim.height()});
       Tensor in_sub = input_.getBatchSlice(b, 1);
 
-      im2col(in_sub, filter_dim, padding, stride, dilation, result);
-      // filter kernel is (K, CRS), result is (CRS, OH*OW)
-      filter_kernel.dot(result, out, false, true);
+      im2col(in_sub, original_filter_dim, padding, stride, dilation, result);
+      
+      if (filter_kernel.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+        unsigned int N = filter_size;
+        unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
+        unsigned int padded_N = ((N + 31) / 32) * 32;
+        unsigned int padded_K = ((K + 31) / 32) * 32;
+        
+        Tensor *result_padded_ptr = &result;
+        if (padded_K != K) {
+           result_padded_ptr = &context.getTensor(tensor_idx[ConvTensors::result_padded]);
+           result_padded_ptr->setZero();
+           
+           float* dst = result_padded_ptr->getData<float>();
+           const float* src = result.getData<float>();
+           unsigned int rows = out_dim.width() * out_dim.height();
+           for(unsigned int r = 0; r < rows; ++r) {
+               std::copy(src + r * K, src + r * K + K, dst + r * padded_K);
+           }
+        }
+        
+        Tensor &tmp_out_padded = context.getTensor(tensor_idx[ConvTensors::tmp_out_padded]);
+        
+        result_padded_ptr->dot(filter_kernel, tmp_out_padded, false, true);
+        
+        Tensor *tmp_out_ptr = &tmp_out_padded;
+        Tensor tmp_out_allocated;
+        if (padded_N != N) {
+           tmp_out_allocated = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), filter_size, out.getTensorType()));
+           float* dst = tmp_out_allocated.getData<float>();
+           const float* src = tmp_out_padded.getData<float>();
+           unsigned int rows = out_dim.width() * out_dim.height();
+           for(unsigned int r = 0; r < rows; ++r) {
+               std::copy(src + r * padded_N, src + r * padded_N + N, dst + r * N);
+           }
+           tmp_out_ptr = &tmp_out_allocated;
+        }
+        
+        float* out_data = out.getData<float>();
+        const float* tmp_data = tmp_out_ptr->getData<float>();
+        unsigned int HW = out_dim.width() * out_dim.height();
+        for (unsigned int n = 0; n < N; ++n) {
+          for (unsigned int hw = 0; hw < HW; ++hw) {
+            out_data[n * HW + hw] = tmp_data[hw * N + n];
+          }
+        }
+      } else {
+        // filter kernel is (K, CRS), result is (CRS, OH*OW)
+        filter_kernel.dot(result, out, false, true);
+      }
     }
     result.deallocate();
   };
@@ -464,7 +551,9 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     forwarding_job(0, in_dim.batch(), 0, nullptr);
   }
 
-  filter_kernel.reshape(filter_dim);
+  if (filter_kernel.getDataType() != ml::train::TensorDim::DataType::Q4_0) {
+    filter_kernel.reshape(filter_dim);
+  }
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias_kernel = context.getWeight(wt_idx[ConvParams::bias]);
