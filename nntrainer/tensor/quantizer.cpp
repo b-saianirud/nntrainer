@@ -10,6 +10,7 @@
 
 #include <cpu_backend.h>
 #include <math.h>
+#include <q4_0_utils.h>
 #include <quantizer.h>
 #include <tensor.h>
 
@@ -359,25 +360,33 @@ Tensor &GgmlQuantizer::quantize(const Tensor &input, Tensor &output,
 }
 
 Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
-  NNTR_THROW_IF(dtype != Tdatatype::FP32, std::invalid_argument)
-    << "[GgmlQuantizer::dequantize] Output dtype must be FP32.";
+  NNTR_THROW_IF(dtype != Tdatatype::FP32 && dtype != Tdatatype::FP16,
+                std::invalid_argument)
+    << "[GgmlQuantizer::dequantize] Output dtype must be FP32 or FP16.";
 
   TensorDim dim = input.getDim();
   unsigned int K = dim.height();
   unsigned int N = dim.width();
   unsigned int total_elems = K * N;
 
-  Tensor output(dim.batch(), dim.channel(), K, N,
-                {Tformat::NCHW, Tdatatype::FP32});
-  size_t data_size = input.size();
-  std::vector<char> tmp(input.size());
+  // The quantize() function transposes the input (K×N → N×K) before
+  // quantizing, so the Q4_0/Q6_K data is stored in N×K order. The
+  // dequantize_row_* functions produce output in that same N×K order.
+  // Create the output tensor as (N, K), fill it, then transpose to (K, N)
+  // to match the original weight tensor layout.
+  //
+  // The dequantize_row_* functions always write FP32. When FP16 output is
+  // requested (W4A16 training), we dequantize to FP32 first, then clone
+  // down to FP16. This still saves memory on the GEMM (FP16×FP16 vs
+  // FP32×FP32) and is faster on ARM where FP16 has 2× throughput.
+  Tensor output(dim.batch(), dim.channel(), N, K,
+                {input.getFormat(), Tdatatype::FP32});
 
   const void *src = input.getData<uint8_t>();
 
   switch (scheme_) {
   case QScheme::Q4_Kx8:
     ///@todo unpack should be supported to fully support dequtize
-    // dequantize_row_q4_K(src, output.getData(), total_elems);
     throw std::invalid_argument(
       "[GgmlQuantizer::dequantize] Q4_Kx8 is not supported yet.");
     break;
@@ -385,16 +394,26 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
     dequantize_row_q6_K(src, output.getData(), total_elems);
     break;
   case QScheme::Q4_0:
-    unpack_q4_0(src, tmp.data(), data_size, N, K);
-    dequantize_row_q4_0(tmp.data(), output.getData(), total_elems);
+#if defined(__aarch64__) || defined(__arm__)
+    Q4_0Utils::dequantizeQ4_0x4(src, N, K, output.getData());
+#else
+    Q4_0Utils::dequantizeQ4_0x8(src, N, K, output.getData());
+#endif
     break;
   default:
     throw std::invalid_argument(
       "[GgmlQuantizer::dequantize] Unsupported QScheme.");
   }
 
+  output = output.transpose("0:2:1");
+
+  // Cast down to FP16 if requested (W4A16 path).
+  if (dtype == Tdatatype::FP16)
+    output = output.clone(Tdatatype::FP16);
+
   return output;
 }
+
 
 QScheme GgmlQuantizer::qscheme() const { return scheme_; }
 

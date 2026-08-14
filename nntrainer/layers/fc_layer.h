@@ -174,6 +174,9 @@ private:
   Tensor a_fq, b_fq;
 
   /**
+
+
+
    * @brief Per-block Q4_0 fake-quantization with EMA-tracked block scales.
    *
    * Blocks are defined in N x K layout (the transposed layout the Q4_0
