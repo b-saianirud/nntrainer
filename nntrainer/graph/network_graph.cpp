@@ -36,7 +36,6 @@
 #include <rnn.h>
 #include <rnncell.h>
 #include <split_layer.h>
-#include <tensor_layer.h>
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
@@ -694,10 +693,14 @@ NetworkGraph::canExecuteInPlace(const std::shared_ptr<LayerNode> &lnode) {
     return inplace_type;
   }
 
-  if (lnode->getType() == InputLayer::type &&
-      !istrequal(getTensorType()[2], "FP32")) {
-    return InPlaceType::NONE;
-  }
+  // Historically, InputLayer was forced non-in-place under a non-FP32
+  // activation dtype because finalize() used to promote the output dim to
+  // the activation dtype, making input/output dtypes differ. With
+  // InputLayer::finalize now preserving the declared input dtype, output
+  // dim equals input dim and the in-place view is always safe. Keeping the
+  // override would break callers that bind an external buffer to the
+  // placeholder output (e.g. KVCacheManager.bind) and rely on the input
+  // sharing storage with that output.
 
   if (lnode->getType() == MultiOutLayer::type) {
     return InPlaceType::RESTRICTING;
@@ -820,11 +823,6 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
           WeightSpec w_spec = init_context.getWeightsSpec()[i];
           s.variable_spec.reference_name = std::get<8>(w_spec);
           s.variable_spec.dim.setFormat(std::get<0>(w_spec).getFormat());
-        } else if (lnode->getType() == TensorLayer::type) {
-          InitLayerContext::TensorSpec t_spec =
-            init_context.getTensorsSpec()[i];
-          s.variable_spec.reference_name = std::get<3>(t_spec);
-          s.variable_spec.dim.setFormat(std::get<0>(t_spec).getFormat());
         } else {
           s.variable_spec.reference_name = inputs[0]->getName();
           s.variable_spec.dim.setFormat(inputs[0]->getDim().getFormat());
@@ -844,12 +842,6 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
           s.gradient_spec->reference_name =
             std::get<8>(w_spec) + Var_Grad::grad_suffix;
           s.gradient_spec->dim.setFormat(std::get<0>(w_spec).getFormat());
-        } else if (lnode->getType() == TensorLayer::type) {
-          InitLayerContext::TensorSpec t_spec =
-            init_context.getTensorsSpec()[i];
-          s.gradient_spec->reference_name =
-            std::get<3>(t_spec) + Var_Grad::grad_suffix;
-          s.gradient_spec->dim.setFormat(std::get<0>(t_spec).getFormat());
         } else {
           s.gradient_spec->reference_name = inputs[0]->getGradientName();
           s.gradient_spec->dim.setFormat(inputs[0]->getDim().getFormat());

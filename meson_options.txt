@@ -20,6 +20,33 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
+# Path to a locally-installed Qualcomm QNN SDK. When enable-npu=true, either
+# this option or the QNN_SDK_ROOT environment variable must be set; the option
+# takes priority when both are provided. The SDK root is used at configure time
+# by nntrainer/qnn/jni/tools/update_qnn_version.py to auto-generate the
+# vendor/ directory (SDK headers + compatibility patches). vendor/ is gitignored
+# and must NOT be committed — it is always produced from the locally-installed SDK.
+# The QNN SDK is "Confidential and Proprietary" Qualcomm code that cannot be
+# redistributed in this repository. Obtain it from Qualcomm Software Center
+# (https://qpm.qualcomm.com/) and pass the extracted SDK root, e.g.:
+#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.47.0
+# Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
+# See docs/backend_guide/QNN_BUILD.md for details.
+option('qnn-sdk-root', type: 'string', value: '')
+# HTP (Hexagon Tensor Processor / HMX) backend via the Qualcomm HexKL
+# CPU Macro API (sdkl.h / libsdkl.so). Proprietary SDK is NOT vendored;
+# pass the extracted hexkl_addon root, e.g.:
+#   meson setup build -Denable-htp=true \
+#     -Dhexkl-sdk-root=/path/to/Hexagon_SDK/.../addons/hexkl_addon
+# Qualcomm Snapdragon only: libsdkl.so drives the Hexagon DSP over FastRPC,
+# so it needs a Qualcomm SoC with an HTP/HMX block -- not ARM in general, and
+# there is no x86 build of it.
+option('enable-htp', type: 'boolean', value: false)
+option('hexkl-sdk-root', type: 'string', value: '')
+# Which prebuilt libsdkl.so to link (lib/<subdir>/libsdkl.so). Keep the CPU-side
+# SDKL helper on armv8: the armv9 prebuilt may use instructions unavailable to
+# the Android app process on current SM8750/V79 devices.
+option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26')
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 
@@ -32,8 +59,7 @@ option('tizen-version-major', type: 'integer', min : 4, max : 9999, value: 9999)
 option('tizen-version-minor', type: 'integer', min : 0, max : 9999, value: 0)
 option('openblas-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
 #This is for the multi-threading in nntrainer
-option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 1)
-option('omp-num-threads', type: 'integer', min : 0, max : 9999, value: 6)
+option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 4)
 option('hgemm-experimental-kernel', type: 'boolean', value: false)
 
 # test related option
@@ -44,7 +70,6 @@ option('enable-long-test', type: 'boolean', value: false)
 option('enable-blas', type: 'boolean', value: true)
 option('enable-fp16', type: 'boolean', value: false)
 option('enable-cublas', type: 'boolean', value: false)
-option('enable-openmp', type: 'boolean', value: true)
 option('enable-opencl', type: 'boolean', value: false)
 option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
@@ -63,11 +88,14 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
-option('libiomp_root', type:'string', value: './libiomp_win')
+option('causallm-tokenizer-lib', type: 'string', value: '',
+       description: 'Windows-only path to tokenizers_c.lib for CausalLM. The default is generated under <builddir>/tokenizers_c_win/target.')
 
 # ARM architecture options
+# Note: Tizen (GBS) builds do not use this option
+# armv7l is a Tizen-only target, so it is not listed here.
 option('arm-arch', type: 'combo',
-       choices: ['none', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
+       choices: ['none', 'armv8.2-a', 'armv9.2-a'],
        value: 'none',
        description: 'Target ARM architecture. "none" disables arm related features.')
 option('arm-march', type: 'string',

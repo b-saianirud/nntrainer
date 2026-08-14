@@ -67,6 +67,8 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   lora_scaling = (lora_rank && !std::get<props::LoraAlpha>(fc_props).empty())
                    ? (float)std::get<props::LoraAlpha>(fc_props) / lora_rank
                    : 1;
+  if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
 
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Fully connected layer takes only one input";
@@ -94,14 +96,22 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   // global configuration
 
   /** Bias Dimension : (1, 1, 1, unit) */
-  /// @note bias is directly added to activation
-  /// since we have no dequantizer for add operation,
-  /// we have to set its data type as same as activation.
-  /// This should be updated when the dequantizer is supported.
-  TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getActivationDataType()),
-    is_nchw ? 0b0001 : 0b0100);
+  /// @note Bias is un-quantized and added directly to the activation. Its
+  /// storage dtype must match how it is laid out on disk:
+  ///  - float weight (FP16/FP32): bias is stored in the activation dtype, so
+  ///    request it as such (no cast needed at the add site).
+  ///  - quantized weight (Q4_0/Q6_K/QINT*/...): bias is stored FP32 on disk;
+  ///    requesting it as the (possibly FP16) activation dtype would reinterpret
+  ///    the FP32 bytes and corrupt it. Request FP32 and cast to the activation
+  ///    dtype at the add site below.
+  const auto weight_dtype = context.getWeightDataType();
+  const bool weight_is_float = (weight_dtype == TensorDim::DataType::FP32 ||
+                                weight_dtype == TensorDim::DataType::FP16);
+  const auto bias_dtype = weight_is_float ? context.getActivationDataType()
+                                          : TensorDim::DataType::FP32;
+  TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                     TensorDim::TensorType(context.getFormat(), bias_dtype),
+                     is_nchw ? 0b0001 : 0b0100);
 
   /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
   TensorDim weight_dim(
@@ -204,6 +214,14 @@ void FullyConnectedLayer::setBatch(nntrainer::RunLayerContext &context,
   }
 }
 
+void FullyConnectedLayer::pack(RunLayerContext &context) {
+  for (auto &w : context.getWeights()) {
+    Tensor &var = w->getVariableRef();
+    if (var.getDataType() == TensorDim::DataType::QS4CX)
+      var.pack();
+  }
+}
+
 void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -232,7 +250,12 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    hidden_.add_i(bias);
+    if (bias.getDataType() != hidden_.getDataType()) {
+      Tensor bias_cast = bias.clone(hidden_.getDataType());
+      hidden_.add_i(bias_cast);
+    } else {
+      hidden_.add_i(bias);
+    }
   }
 }
 
@@ -244,6 +267,10 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
+    return;
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);
@@ -303,7 +330,12 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
         disable_bias.empty() || disable_bias.get() == false) {
       Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-      hidden_step.add_i(bias);
+      if (bias.getDataType() != hidden_step.getDataType()) {
+        Tensor bias_cast = bias.clone(hidden_step.getDataType());
+        hidden_step.add_i(bias_cast);
+      } else {
+        hidden_step.add_i(bias);
+      }
     }
   }
 }

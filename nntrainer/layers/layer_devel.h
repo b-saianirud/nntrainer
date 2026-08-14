@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -245,6 +246,15 @@ public:
   virtual void calcGradient(RunLayerContext &context) {}
 
   /**
+   * @brief     Pack the layer's weights into a backend-optimized layout
+   * @details   Invoked after weights are loaded.
+   * - The default implementation is a no-op
+   * - Each derived layer overrides this if weight repack needed
+   * @param     context Context of the layer, providing access to its weights
+   */
+  virtual void pack(RunLayerContext &context) {}
+
+  /**
    * @brief     set Property of layer
    * @param     values values of property
    * @throw std::invalid_argument invalid parameter.
@@ -350,11 +360,13 @@ public:
    * @param mode Execution mode
    * @param trainable is there trainable weight
    * @param dtype data type to save this layer
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (DEFAULT/X86/ARM)
    */
-  virtual void
-  save(std::ofstream &file, RunLayerContext &run_context, bool opt_var,
-       ml::train::ExecutionMode mode, bool trainable,
-       TensorDim::DataType dtype = TensorDim::DataType::NONE) const {
+  virtual void save(std::ofstream &file, RunLayerContext &run_context,
+                    bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+                    TensorDim::DataType dtype = TensorDim::DataType::NONE,
+                    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const {
 
     if (opt_var) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
@@ -405,9 +417,32 @@ public:
                 quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                            quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::QS4CX) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              ///@note The codelines below can be replaced with quantizer's
+              /// quantize()
+              TensorDim dim = weight.getDim();
+              size_t K = dim.height();
+              size_t N = dim.width();
+              Tensor weight_t = weight.transpose("0:2:1");
+
+              size_t q_size = N * ((K + 1) / 2);
+              size_t scale_size = N * sizeof(float);
+
+              // allocate packed size, not an unpacked size
+              std::vector<uint8_t> rhs_q(q_size + scale_size);
+              uint8_t *data = rhs_q.data();
+
+              uint8_t *scale = data + q_size;
+
+              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
+                                         true);
+              file.write((const char *)data, q_size + scale_size);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
@@ -482,7 +517,8 @@ public:
   virtual void read(ReadSource src, RunLayerContext &run_context, bool opt_var,
                     ml::train::ExecutionMode mode, bool trainable,
                     TensorDim::DataType defineWeightDataType, bool fsu,
-                    size_t start_offset = 0, bool read_from_offset = false) {
+                    size_t start_offset = 0, bool read_from_offset = false,
+                    int file_fd = -1) {
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -505,7 +541,11 @@ public:
         for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
           /// @note shared weights are only be read at the first acecss
           if (run_context.isGradientFirstAccess(i)) {
-            run_context.getWeight(i).read(src, start_offset, read_from_offset);
+            // file_fd is forwarded so virtual weights (e.g. SlimMoE expert
+            // tensors) can capture a long-lived fd for later mmap-on-demand
+            // in activate(); non-virtual weights ignore it.
+            run_context.getWeight(i).read(src, start_offset, read_from_offset,
+                                          file_fd);
             if (run_context.isMixedPrecision(i) && trainable &&
                 !run_context.getWeightFP32(i).empty()) {
               run_context.getWeightFP32(i).copyData(run_context.getWeight(i));

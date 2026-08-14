@@ -2,7 +2,11 @@ name: "Build Test - Ubuntu Meson"
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   meson_test:
@@ -15,30 +19,47 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Check if rebuild required
+      uses: ./.github/actions/check-rebuild
     - name: Set up Python 3.10
+      if: env.rebuild == '1'
       uses: actions/setup-python@v5
       with:
         python-version: "3.10"
     - name: install additional package from PPA for testing
+      if: env.rebuild == '1'
       run: sudo add-apt-repository -y ppa:nnstreamer/ppa && sudo apt-get update
     - name: install minimal requirements
+      if: env.rebuild == '1'
       run: sudo apt-get update && sudo apt-get install -y gcc g++ pkg-config libopenblas-dev libiniparser-dev libjsoncpp-dev libcurl3-dev tensorflow2-lite-dev nnstreamer-dev libglib2.0-dev libgstreamer1.0-dev libgtest-dev ml-api-common-dev flatbuffers-compiler ml-inference-api-dev libunwind-dev
     - name: install additional packages for features
+      if: env.rebuild == '1'
       run: sudo apt-get install -y python3-dev python3-numpy python3
     - name: gcc version change
+      if: env.rebuild == '1'
       run: |
         sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
         sudo apt-get update
         sudo apt-get install -y --fix-broken build-essential
         sudo apt-get install -y gcc-13 g++-13 libcc1-0 libgcc-13-dev
-        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 1000 
+        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 1000
         sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 1000
         sudo update-alternatives --set gcc /usr/bin/gcc-13
     - name: Install submodules
+      if: env.rebuild == '1'
       run: git submodule sync && git submodule update --init --recursive
     - name: install build systems
+      if: env.rebuild == '1'
       run: sudo apt install meson ninja-build
-    - run: |
+    - if: env.rebuild == '1'
+      run: |
+        causallm_option="-Denable-transformer=false"
+        if [ "${{ matrix.meson_options }}" = "-Denable-fp16=false" ]; then
+          causallm_option="-Denable-transformer=true"
+        fi
+
         meson \
           --buildtype=plain \
           --prefix=/usr \
@@ -47,6 +68,7 @@ jobs:
           --bindir=lib/nntrainer/bin \
           --includedir=include \
           -Dinstall-app=true \
+          ${causallm_option} \
           -Dreduce-tolerance=false \
           -Denable-debug=true \
           -Dml-api-support=enabled \
@@ -58,8 +80,32 @@ jobs:
           -Denable-capi=enabled \
           ${{ matrix.meson_options }} \
           build
-    - run: ninja -C build
+    - name: Check CausalLM model tests are enabled
+      if: ${{ matrix.meson_options == '-Denable-fp16=false' && env.rebuild == '1' }}
+      run: |
+        meson introspect build --tests > meson-tests.json
+        python3 - <<'PY'
+        import json
+
+        with open("meson-tests.json", encoding="utf-8") as test_file:
+            tests = {test["name"] for test in json.load(test_file)}
+
+        required_tests = {
+            "unittest_causallm_models",
+        }
+        missing_tests = sorted(required_tests - tests)
+        if missing_tests:
+            raise SystemExit(
+                "Missing CausalLM Meson tests: " + ", ".join(missing_tests)
+            )
+
+        print("CausalLM Meson model tests enabled: " + ", ".join(sorted(required_tests)))
+        PY
+    - if: env.rebuild == '1'
+      run: ninja -C build
     - name: run App Tests
-      run: meson test -C build --no-suite unittests
+      if: env.rebuild == '1'
+      run: meson test -C build --no-suite unittests --print-errorlogs
     - name: run Unittests
-      run: meson test -C build --suite unittests
+      if: env.rebuild == '1'
+      run: meson test -C build --suite unittests --print-errorlogs

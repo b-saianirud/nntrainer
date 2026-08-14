@@ -30,7 +30,7 @@ typedef struct {
   double total_duration_ms;
   double initialization_duration_ms;
   size_t peak_memory_kb;
-} PerformanceMetrics;
+} TransformerPerformanceMetrics;
 
 #ifdef __cplusplus
 }
@@ -39,8 +39,12 @@ typedef struct {
 #ifdef __cplusplus
 
 #ifdef _WIN32
-#include <psapi.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#include <psapi.h>
 #else
 #include <sys/resource.h>
 #endif

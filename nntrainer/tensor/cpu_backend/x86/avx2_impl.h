@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <limits>
 #include <stddef.h>
+#include <tensor_dim.h>
 
 namespace nntrainer::avx2 {
 
@@ -196,6 +197,27 @@ void softmax_row_inplace(T *qk_out, size_t start_row, size_t end_row,
 template <typename T = float>
 void softmax_row(float *qk_out, size_t start_row, size_t end_row,
                  size_t num_heads, T *sink = nullptr);
+
+/**
+ * @brief AVX2 fp32 causal depthwise Conv1D prefill for kernel size 3.
+ *
+ * Input and output are contiguous [B, H, W]. For each channel c, the kernel
+ * uses packed_weight [w0 | w1 | w2] and computes the causal recurrence over H:
+ * y_t = w0*x_t + w1*x_{t-1} + w2*x_{t-2} (+ bias).
+ */
+void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                const float *bias, float *output,
+                                unsigned int B, unsigned int H, unsigned int W);
+
+/**
+ * @brief AVX2 fp32 single-token decode for causal depthwise Conv1D.
+ *
+ * Reads state [x_{t-2} | x_{t-1}], writes y_cur for x_cur, and shifts the
+ * state in-place to [x_{t-1} | x_t].
+ */
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W);
 
 /**
  * @brief Compute vcache for one row transposed

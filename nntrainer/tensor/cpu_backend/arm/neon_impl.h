@@ -16,6 +16,7 @@
 #ifdef __cplusplus
 
 #include <arm_neon.h>
+#include <climits> // UINT_MAX
 #include <cmath>
 #include <limits>
 #include <neon_mathfun.h>
@@ -831,6 +832,27 @@ template <typename T = float>
 void softmax_row(T *qk_out, size_t start_row, size_t end_row, size_t num_heads,
                  T *sink = nullptr);
 
+/**
+ * @brief NEON fp32 causal depthwise Conv1D prefill for kernel size 3.
+ *
+ * Input and output are contiguous [B, H, W]. For each channel c, the kernel
+ * uses packed_weight [w0 | w1 | w2] and computes the causal recurrence over H:
+ * y_t = w0*x_t + w1*x_{t-1} + w2*x_{t-2} (+ bias).
+ */
+void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                const float *bias, float *output,
+                                unsigned int B, unsigned int H, unsigned int W);
+
+/**
+ * @brief NEON fp32 single-token decode for causal depthwise Conv1D.
+ *
+ * Reads state [x_{t-2} | x_{t-1}], writes y_cur for x_cur, and shifts the
+ * state in-place to [x_{t-1} | x_t].
+ */
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W);
+
 #ifdef ENABLE_FP16
 /**
  * @brief Multihead softmax with mixed precision, inplace version (overload)
@@ -898,7 +920,7 @@ void clamp(const T *input, T *output, size_t length,
 
 /**
  * @brief Transforms data from in-memory layout osv32_isv2 to block_q4_0x4
- * in-memory layout with ARM NEON optimization and OpenMP parallelization.
+ * in-memory layout with ARM NEON optimization.
  * @param N number of rows
  * @param K number of columns
  * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
@@ -983,6 +1005,20 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
                                      const float *sin_,
                                      bool only_convert_to_fp16);
 #endif
+
+/**
+ * @brief qs4cx dequantization of a single channel (row) with NEON optimization
+ * Converts quantized int4 back to float32 using per-channel scales.
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row (channel)
+ * @param[in] qs4cx full nxk quantized matrix data
+ * @param[in] scales per-channel quantization scales
+ * @param[out] out dequantized row data in float32 (k floats)
+ */
+void dequantize_row_qs4cx_neon(size_t n_idx, size_t k, const uint8_t *qs4cx,
+                               const float *scales, float *out);
+
 } // namespace nntrainer::neon
 
 #endif /* __cplusplus */

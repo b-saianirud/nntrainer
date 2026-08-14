@@ -13,7 +13,6 @@
 #include <arm_compute_backend.h>
 #include <assert.h>
 #include <fallback_internal.h>
-#include <fallback_kleidiai.h>
 #include <ggml_interface.h>
 #include <kleidiai_interface.h>
 #include <neon_impl.h>
@@ -405,7 +404,7 @@ template <>
 void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                        _FP16 *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
-  __fallback_rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
+  neon::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
 }
 
 template <>
@@ -433,62 +432,12 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
   neon::rms_norm_wrt_width_fp16_intrinsic(X, Y, H, W, epsilon);
 }
 
-void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
-                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
-                          bool transB) {
-  __fallback_nntr_quant_qs4cx_f32(n, k, rhs_native_mtx_f32,
-                                  rhs_native_mtx_qs4cx, rhs_scales_f32, transB);
-}
-
 void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                            void *rhs_native_mtx_f32,
                            void *rhs_native_mtx_qs4c32) {
   nntr_kai_quant_qs4c32_f32(n, k, bl, (const float *)rhs_native_mtx_f32,
                             (uint8_t *)rhs_native_mtx_qs4c32);
 }
-
-template <>
-uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
-  bool transB, float lower_bound, float upper_bound) {
-  return nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
-    m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
-    dst_mtx_f32, transB, lower_bound, upper_bound);
-}
-
-size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
-                                                  uint32_t idx_variant,
-                                                  bool transB) {
-  return nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
-                                                        transB);
-}
-
-void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
-                                     void *rhs_packed_mtx_qs4cx,
-                                     void *rhs_native_mtx_qs4cx,
-                                     void *rhs_scales_f32, uint32_t idx_variant,
-                                     bool transB) {
-  nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(n, k, rhs_packed_mtx_qs4cx,
-                                      rhs_native_mtx_qs4cx, rhs_scales_f32,
-                                      idx_variant, transB);
-}
-
-template <>
-void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
-                                      void *lhs_native_mtx_f32,
-                                      void *rhs_packed_mtx_qs4cx,
-                                      float *dst_act_mtx_f32,
-                                      uint32_t idx_variant, bool transB,
-                                      float lower_bound, float upper_bound) {
-  nntr_kai_gemm_qai8dxp_qsi4cxp_olp(
-    m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
-    idx_variant, transB, lower_bound, upper_bound);
-}
-
-} /* namespace nntrainer */
-
-namespace nntrainer {
 
 size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
                                                   uint32_t idx_variant,

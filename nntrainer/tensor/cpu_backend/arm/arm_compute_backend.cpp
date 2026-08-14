@@ -15,8 +15,12 @@
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
+#include <compute_ops.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
+#ifndef ARMV7
+#include <kleidiai_interface.h>
+#endif
 #include <neon_impl.h>
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
@@ -25,8 +29,11 @@ namespace nntrainer {
 
 void init_backend() {
   __ggml_init();
+#ifdef USE_BLAS
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
+#endif
+  g_compute_ops = get_cpu_ops();
 }
 
 void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,
@@ -470,8 +477,24 @@ void repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,
 }
 
 void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
-                 const unsigned int N) {
-  __ggml_repack_q4_0_to_q4_0_4(dst, src, data_size, M, N);
+                 const unsigned int N, ml::train::ISA target) {
+
+  switch (target) {
+  case ml::train::ISA::X86:
+    // Use x86 format (q4_0x8) for cross-platform quantization
+    __ggml_repack_q4_0_to_q4_0_8(dst, src, data_size, M, N);
+    break;
+  case ml::train::ISA::ARM:
+    // Use ARM format (q4_0x4)
+    __ggml_repack_q4_0_to_q4_0_4(dst, src, data_size, M, N);
+    break;
+  case ml::train::ISA::DEFAULT:
+    // Use ARM format (q4_0x4)
+    __ggml_repack_q4_0_to_q4_0_4(dst, src, data_size, M, N);
+    break;
+  default:
+    break;
+  }
 }
 
 void repack_q4_K(void *dst, void *src, size_t data_size, const unsigned int M,
@@ -591,6 +614,176 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
 #else
   __fallback_transform_int4_osv32_isv2_to_q4_0(
     N, K, osv32_weights, osv32_scales, scale_group_size, 4, dst_q4_0x);
+#endif
+}
+
+void quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
+                     bool is_nxk) {
+  if (is_nxk) {
+    __fallback_quant_nxk_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                   (uint8_t *)rhs_native_mtx_qs4cx,
+                                   (float *)rhs_scales_f32);
+  } else {
+    __fallback_quant_kxn_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                   (uint8_t *)rhs_native_mtx_qs4cx,
+                                   (float *)rhs_scales_f32);
+  }
+}
+
+void dequant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs4cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32,
+                       bool is_nxk) {
+  if (is_nxk) {
+    __fallback_dequant_nxk_qs4cx_f32(
+      n, k, (const uint8_t *)rhs_native_mtx_qs4cx,
+      (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+  } else {
+    __fallback_dequant_kxn_qs4cx_f32(
+      n, k, (const uint8_t *)rhs_native_mtx_qs4cx,
+      (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+  }
+}
+
+void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+#ifdef __ARM_NEON
+  nntrainer::neon::dequantize_row_qs4cx_neon(
+    n_idx, k, (const uint8_t *)rhs_native_mtx_qs4cx,
+    (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+#else
+  __fallback_dequantize_row_qs4cx_f32(
+    n_idx, k, (const uint8_t *)rhs_native_mtx_qs4cx,
+    (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+#endif
+}
+
+void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs8cx, void *rhs_scales_f32) {
+  __fallback_quant_nxk_qs8cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                 (int8_t *)rhs_native_mtx_qs8cx,
+                                 (float *)rhs_scales_f32);
+}
+
+void dequant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs8cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+  __fallback_dequant_nxk_qs8cx_f32(n, k, (const int8_t *)rhs_native_mtx_qs8cx,
+                                   (const float *)rhs_scales_f32,
+                                   (float *)rhs_native_mtx_f32);
+}
+
+void dequantize_row_qs8cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs8cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+  // qs8cx dequantization is a memory-bound int8->f32 widening. The compiler
+  // auto-vectorizes the scalar fallback into NEON at -O2/-O3, so a hand-written
+  // NEON kernel offered no speedup over the fallback and was dropped.
+  __fallback_dequantize_row_qs8cx_f32(
+    n_idx, k, (const int8_t *)rhs_native_mtx_qs8cx,
+    (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+}
+
+size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                             size_t idx_variant, bool is_nxk) {
+#ifndef ARMV7
+  return __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, is_nxk);
+#else
+  return __fallback_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
+                                                          is_nxk);
+#endif
+}
+
+void rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k, void *rhs_packed_mtx_qs4cx,
+                                void *rhs_native_mtx_qs4cx,
+                                void *rhs_scales_f32, size_t idx_variant,
+                                bool is_nxk) {
+#ifndef ARMV7
+  __kai_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                   rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                   idx_variant, is_nxk);
+#else
+  __fallback_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                        rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                        idx_variant, is_nxk);
+#endif
+}
+
+void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  size_t idx_variant, bool is_nxk, float lower_bound, float upper_bound) {
+#ifndef ARMV7
+  __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+    m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
+    dst_act_mtx_f32, idx_variant, is_nxk, lower_bound, upper_bound);
+#else
+  // online quant lhs
+  const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
+
+  std::vector<uint8_t> lhs_qa8dx(lhs_ref_size_qa8dx);
+
+  __fallback_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32,
+                             (int8_t *)lhs_qa8dx.data());
+
+  // do matmul
+  if (is_nxk) {
+    __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
+      m, n, k, (const int8_t *)lhs_qa8dx.data(),
+      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
+      dst_act_mtx_f32, lower_bound, upper_bound);
+  } else {
+    __fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
+      m, n, k, (const int8_t *)lhs_qa8dx.data(),
+      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
+      dst_act_mtx_f32, lower_bound, upper_bound);
+  }
+#endif
+}
+
+void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                          void *lhs_native_mtx_f32, void *rhs_packed_mtx_qs4cx,
+                          float *dst_act_mtx_f32, size_t idx_variant,
+                          float lower_bound, float upper_bound) {
+#ifndef ARMV7
+  __kai_gemm_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx,
+                             dst_act_mtx_f32, idx_variant, lower_bound,
+                             upper_bound);
+#else
+  __fallback_gemm_qai8dxp_qsi4cxp_packed(m, n, k, lhs_native_mtx_f32,
+                                         rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
+                                         idx_variant, lower_bound, upper_bound);
+#endif
+}
+
+// Dispatches to the NEON prefill kernel on AArch64.
+void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                const float *bias, float *output,
+                                unsigned int B, unsigned int H,
+                                unsigned int W) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  nntrainer::neon::causal_depthwise_conv1d_k3(input, packed_weight, bias,
+                                              output, B, H, W);
+#endif
+}
+
+// Single-token decode wrapper. Non-AArch64 builds use the scalar fallback
+// because decode is on the hot path for CausalLM incremental inference.
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  nntrainer::neon::causal_depthwise_conv1d_k3_decode(x_cur, packed_weight,
+                                                     state, y_cur, W);
+#else
+  const float *w0 = packed_weight;
+  const float *w1 = packed_weight + W;
+  const float *w2 = packed_weight + 2 * W;
+  const float *s0 = state;     // x_{t-2}
+  const float *s1 = state + W; // x_{t-1}
+  for (unsigned int c = 0; c < W; ++c) {
+    y_cur[c] = w0[c] * x_cur[c] + w1[c] * s1[c] + w2[c] * s0[c];
+  }
+  std::memmove(state, state + W, W * sizeof(float));
+  std::memcpy(state + W, x_cur, W * sizeof(float));
 #endif
 }
 

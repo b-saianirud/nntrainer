@@ -47,12 +47,7 @@ endif
 endif
 
 LOCAL_MODULE := tensorflow-lite
-LIB_ := arm64
-
-ifeq ($(APP_ABI), armeabi-v7a)
-	LIB_ := armv7
-endif
-LOCAL_SRC_FILES := $(TENSORFLOW_ROOT)/lib/$(LIB_)/libtensorflow-lite.a
+LOCAL_SRC_FILES := $(TENSORFLOW_ROOT)/lib/arm64/libtensorflow-lite.a
 LOCAL_EXPORT_C_INCLUDES := $(TENSORFLOW_ROOT)/include
 LOCAL_EXPORT_LDLIBS := -lEGL -lGLESv2
 
@@ -82,16 +77,14 @@ include $(PREBUILT_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 
-LOCAL_ARM_NEON := true
 LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -Ilz4-nougat/lib
 LOCAL_LDFLAGS += -Llz4-nougat/lib/obj/local/$(TARGET_ARCH_ABI)/
 LOCAL_CXXFLAGS += -std=c++17 -frtti
-LOCAL_CFLAGS += -pthread -fexceptions -fopenmp
+LOCAL_CFLAGS += -pthread -fexceptions
 LOCAL_LDFLAGS += -fexceptions
 LOCAL_MODULE_TAGS := optional
-LOCAL_ARM_MODE := arm
 LOCAL_MODULE := nntrainer_classification
-LOCAL_LDLIBS := -llog -landroid -fopenmp
+LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := main.cpp
 
@@ -106,16 +99,14 @@ include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 
-LOCAL_ARM_NEON := true
 LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -Ilz4-nougat/lib
 LOCAL_LDFLAGS += -Llz4-nougat/lib/obj/local/$(TARGET_ARCH_ABI)/
 LOCAL_CXXFLAGS += -std=c++17 -frtti
-LOCAL_CFLAGS += -pthread -fexceptions -fopenmp
+LOCAL_CFLAGS += -pthread -fexceptions
 LOCAL_LDFLAGS += -fexceptions
 LOCAL_MODULE_TAGS := optional
-LOCAL_ARM_MODE := arm
 LOCAL_MODULE := nntrainer_classification_func
-LOCAL_LDLIBS := -llog -landroid -fopenmp
+LOCAL_LDLIBS := -llog -landroid
 
 LOCAL_SRC_FILES := main_func.cpp
 

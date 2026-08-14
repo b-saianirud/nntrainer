@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu17',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -75,7 +75,6 @@ warning_flags = [
   '-Wno-error=varargs',
   '-Wno-error=ignored-attributes',
   '-Wno-error=sign-compare',
-  '-Wdefaulted-function-deleted',
   '-ftree-vectorize',
   '-Wno-unused-variable',
   '-Wno-comment',
@@ -92,15 +91,16 @@ else
   warning_flags += '-Wno-maybe-uninitialized'
 endif
 
+warning_cxx_flags = [
+  '-Wdefaulted-function-deleted'
+]
+
 warning_c_flags = [
   '-Wmissing-declarations',
   '-Wmissing-include-dirs',
   '-Wmissing-prototypes',
   '-Wnested-externs',
-  '-Waggregate-return',
-  '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
-  '-Wno-error=varargs'
+  '-Wold-style-definition'
 ]
 
 arch = host_machine.cpu_family()
@@ -131,10 +131,10 @@ elif arch == 'x86' or arch == 'x86_64'
   if cxx_compiler_id == 'msvc'
     add_project_arguments(['/arch:AVX2'], language: ['c','cpp'])
     # Note: C runtime library (/MT or /MD) is controlled by b_vscrt option
+    message('/arch:AVX2 added for AVX hardware acceleration.')
   else
-    add_project_arguments(['-march=native'], language: ['c','cpp'])
-    add_project_arguments(['-mavx2', '-mfma'], language: ['c','cpp'])
-    message('-march=native added for AVX hardware acceleration.')
+    add_project_arguments(['-mavx2', '-mfma', '-mf16c'], language: ['c','cpp'])
+    message('-mavx2, -mfma, -mf16c added for AVX hardware acceleration.')
   endif
 endif
 
@@ -154,9 +154,18 @@ else
   extra_defines += '-DKERNEL_CACHE=0'
 endif
 
+if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
+  extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+  extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+endif
+
 if get_option('enable-fp16')
    if get_option('platform') == 'android'
-     add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     # NDK clang (and non-ARM host compilers used for the meson-built QNN
+     # plugin) reject -mfp16-format=ieee; only pass it when supported.
+     if cxx.has_argument('-mfp16-format=ieee')
+       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'aarch64'
@@ -213,7 +222,11 @@ if get_option('enable-fp16')
      error ('RISCV64 RVV support and fp16 support is not yet implemented.')
    else
      error ('FP16 support for this arch is not yet implemented.')
-   endif  
+   endif
+else
+  if arch == 'aarch64'
+    add_project_arguments('-march=armv8.2-a+dotprod+i8mm', language: ['c', 'cpp'])
+  endif
 endif
 
 if get_option('enable-mmap')
@@ -258,6 +271,35 @@ if get_option('opencl-kernel-path') != ''
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
 endif
 
+# HTP (Hexagon/HMX) backend via Qualcomm HexKL CPU Macro API (libsdkl.so).
+# Qualcomm Snapdragon only — libsdkl.so talks to the Hexagon DSP over FastRPC,
+# so it needs a Qualcomm SoC with an HTP/HMX block, not ARM in general, and
+# there is no x86 build of it. Default off, so x86/CI builds are unaffected.
+# hexkl_dep is referenced only under this guard (mirrors how clblast_dep is
+# referenced only when enable-opencl).
+if get_option('enable-htp')
+  hexkl_root = get_option('hexkl-sdk-root')
+  if hexkl_root == ''
+    error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
+  endif
+  hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
+  # Derive the Hexagon SDK root from the addon path (two levels up).
+  # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
+  # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
+  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
+  hexkl_inc = include_directories(
+    hexkl_root / 'include',
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    is_system: true)
+  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
+  hexkl_dep = declare_dependency(
+    dependencies: libsdkl,
+    include_directories: hexkl_inc)
+  extra_defines += '-DENABLE_HEXKL=1'
+  message('HTP/HexKL backend enabled, linking ' + hexkl_lib_dir / 'libsdkl.so')
+endif
+
 if get_option('enable-biqgemm')
   # In order to enable biqgemm, BiQGEMM lib, which is header-only library, is required.
   # This meson tries to find its installation.
@@ -287,6 +329,12 @@ if cc.get_id() != 'msvc' and cxx.get_id() != 'msvc'
     if cc.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'c')
     endif
+    if cxx.has_argument (extra_arg)
+      add_project_arguments([extra_arg], language: 'cpp')
+    endif
+  endforeach
+
+  foreach extra_arg : warning_cxx_flags
     if cxx.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'cpp')
     endif
@@ -461,48 +509,6 @@ endif
 
 extra_defines += '-DNNTR_NUM_THREADS=@0@'.format(get_option('nntr-num-threads'))
 message('set nntrainer num threads=@0@'.format(get_option('nntr-num-threads')))
-openmp_dep = dummy_dep
-if get_option('enable-openmp')
- # For Windows on x64, use OpenMP 5.0 instead of the OpenMP 2.0 standard
-  openmp_win_found = false
-  if cxx_compiler_id == 'msvc' and (arch == 'x86' or arch == 'x86_64')
-    omp_lib_subdir = 'x64'
-    omp_lib_name = 'libiomp5md'
-    openmp_win_found = true
-  elif cxx_compiler_id == 'clang-cl' and (arch == 'aarch64' or arch == 'arm64')
-    omp_lib_subdir = 'arm64'
-    omp_lib_name = 'libomp'
-    openmp_win_found = true
-  endif
-
-  if openmp_win_found
-    libiomp_root_opt = get_option('libiomp_root')
-    libiomp_root = join_paths(meson.project_source_root(), libiomp_root_opt)
-    omp_libdir = libiomp_root / omp_lib_subdir
-    omp_incdir = join_paths(libiomp_root_opt, 'include')
-
-    omp_libdir_win = omp_libdir.replace('/', '\\')
-    run_command(['xcopy', '/C', '/Y', omp_libdir_win, meson.current_build_dir()], check: true)
-
-    add_project_arguments('/openmp', language: ['cpp','c'])
-    cpp = meson.get_compiler('cpp')
-    libiomp = cpp.find_library(omp_lib_name, dirs: omp_libdir, required: true)
-
-    openmp_dep = declare_dependency(
-      include_directories : include_directories(omp_incdir),
-      compile_args : ['/openmp'],
-      link_args : ['/NODEFAULTLIB:vcomp'],
-      dependencies : [libiomp])
-
-    message('set openmp with @0@ for windows @1@-----------------'.format(omp_lib_name, omp_lib_subdir))
-  else
-    openmp_dep = dependency('openmp')
-  endif
-  if get_option('omp-num-threads') > 0
-    extra_defines += '-DOMP_NUM_THREADS=@0@'.format(get_option('omp-num-threads'))
-    message('set nntrainer omp threads=@0@'.format(get_option('omp-num-threads')))
-  endif
-endif
 
 if get_option('enable-profile')
   extra_defines += '-DPROFILE=1'

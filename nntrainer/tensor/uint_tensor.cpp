@@ -155,7 +155,7 @@ template <typename T> void UIntTensor<T>::allocate() {
 
     mem_data = new MemoryData(
       (void *)(new T[dim.getDataLen() + (sizeof(float) + sizeof(unsigned int)) /
-                                          sizeof(T) * scale_size()]{}));
+                                          sizeof(T) * scale_size()]));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<T>();
       delete mem_data;
@@ -297,12 +297,22 @@ template <typename T> void UIntTensor<T>::initialize() {
 
   /// @note Sampling from the normal/uniform distribution is invalid
   switch (initializer) {
-  case Initializer::ZEROS:
+  case Initializer::ZEROS: {
     setZero();
+    float *scale = (float *)getScale();
+    std::fill(scale, scale + scale_size(), 1.0f);
+    unsigned int *zerop = getZeroPoint();
+    std::fill(zerop, zerop + scale_size(), 0u);
     break;
-  case Initializer::ONES:
+  }
+  case Initializer::ONES: {
     setValue(1.0f);
+    float *scale = (float *)getScale();
+    std::fill(scale, scale + scale_size(), 1.0f);
+    unsigned int *zerop = getZeroPoint();
+    std::fill(zerop, zerop + scale_size(), 0u);
     break;
+  }
   case Initializer::NONE:
     break;
   default:
@@ -384,7 +394,12 @@ void UIntTensor<T>::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+#ifdef ENABLE_NPU
+  start_offset = 0;
+  read_from_offset = false;
+#else
   read_quantization_info(file, start_offset, read_from_offset);
+#endif
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -600,6 +615,9 @@ template <typename T> void UIntTensor<T>::copy(const void *buf) {
     const uint16_t *data = (const uint16_t *)buf;
     uint16_t *rdata = (uint16_t *)getData();
     copy_u16((const unsigned int)size(), data, rdata);
+#ifdef ENABLE_NPU
+    return;
+#endif
   } else {
     /// @todo need to optimize
     memcpy(getData(), buf, size() * (sizeof(T)));

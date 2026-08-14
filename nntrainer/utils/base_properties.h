@@ -662,12 +662,12 @@ void from_string(const std::string &value, std::vector<T> &property) {
 struct TensorDataTypeInfo {
   using Enum = nntrainer::TensorDim::DataType;
   static constexpr std::initializer_list<Enum> EnumList = {
-    Enum::BCQ,    Enum::QINT4, Enum::QINT8, Enum::QINT16,
-    Enum::FP16,   Enum::FP32,  Enum::UINT4, Enum::UINT8,
-    Enum::UINT16, Enum::Q4_K,  Enum::Q6_K,  Enum::Q4_0};
+    Enum::BCQ,  Enum::QINT4, Enum::QINT8, Enum::QINT16, Enum::FP16,
+    Enum::FP32, Enum::UINT4, Enum::UINT8, Enum::UINT16, Enum::Q4_K,
+    Enum::Q6_K, Enum::Q4_0,  Enum::QS4CX};
   static constexpr const char *EnumStr[] = {
-    "BCQ",   "QINT4", "QINT8",  "QINT16", "FP16", "FP32",
-    "UINT4", "UINT8", "UINT16", "Q4_K",   "Q6_K", "Q4_0"};
+    "BCQ",   "QINT4",  "QINT8", "QINT16", "FP16", "FP32", "UINT4",
+    "UINT8", "UINT16", "Q4_K",  "Q6_K",   "Q4_0", "QS4CX"};
 };
 
 /**
@@ -731,6 +731,29 @@ public:
 };
 
 /**
+ * @brief Input Data Type Enumeration Information
+ *  This property can be used by input layers to preserve a non-default
+ *  placeholder dtype instead of inheriting the model activation dtype.
+ */
+class InputDtype final : public EnumProperty<TensorDataTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "input_dtype";
+
+  /**
+   * @brief Constructor
+   */
+  InputDtype(){};
+
+  /**
+   * @brief Constructor
+   *
+   * @param value value to set
+   */
+  InputDtype(TensorDataTypeInfo::Enum value) { set(value); };
+};
+
+/**
  * @brief Activation Enumeration Information
  *
  */
@@ -788,9 +811,9 @@ public:
  */
 struct ComputeEngineTypeInfo {
   using Enum = ml::train::LayerComputeEngine;
-  static constexpr std::initializer_list<Enum> EnumList = {Enum::CPU, Enum::GPU,
-                                                           Enum::QNN};
-  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn"};
+  static constexpr std::initializer_list<Enum> EnumList = {
+    Enum::CPU, Enum::GPU, Enum::QNN, Enum::HTP};
+  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn", "htp"};
 };
 
 /**

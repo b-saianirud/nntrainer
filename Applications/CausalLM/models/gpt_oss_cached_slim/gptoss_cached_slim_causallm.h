@@ -3,6 +3,7 @@
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
  * @file   gptoss_causallm.h
+ * @brief  Cached, slimmed-down GPT-OSS causal language model implementation.
  * @date   26 Aug 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -37,18 +38,15 @@ public:
    * @brief createAttention
    * @note sink attention with sliding window
    */
-  std::vector<LayerHandle> createAttention(const int layer_id, int seq_len,
-                                           int n_heads, int head_dim,
-                                           std::string query_name,
-                                           std::string key_name,
-                                           std::string value_name) override;
+  Tensor createAttention(const int layer_id, int seq_len, int n_heads,
+                         int head_dim, Tensor query, Tensor key,
+                         Tensor value) override;
 
   /**
    * @brief MoE layer
    */
-  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                     int hidden_dim,
-                                     std::string input_name) override;
+  Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                   Tensor input) override;
 
   /**
    * @brief setupParameters

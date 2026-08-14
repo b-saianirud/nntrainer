@@ -19,9 +19,13 @@
 
 #include <app_context.h>
 #include <base_properties.h>
+#include <compute_ops.h>
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+#include <htp_context.h>
+#endif
 
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
@@ -36,19 +40,46 @@ std::once_flag global_engine_init_flag;
 nntrainer::Context
   *Engine::nntrainerRegisteredContext[Engine::RegisterContextMax];
 
+Engine &Engine::Global() {
+  // Single definition in libnntrainer.so → one Engine instance shared by every
+  // consumer .so (see declaration in engine.h). initializeOnce() registers the
+  // default contexts (cpu/gpu, and qnn when ENABLE_NPU) exactly once.
+  static Engine instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
 
   auto &app_context = nntrainer::AppContext::Global();
 
-  init_backend(); // initialize cpu backend
+  // Ensure CPU backend compute-ops table is bound. ensureComputeOps() is
+  // std::call_once-guarded, so this call is safe even if AppContext or
+  // another Context already initialized it.
+  ensureComputeOps();
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
+#endif
+
+#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+  auto &htp_context = nntrainer::HtpContext::Global();
+  registerContext("htp", &htp_context);
+#endif
+
+#if defined(ENABLE_NPU) && ENABLE_NPU == 1
+  // QNN context is loaded as a plugin .so for decoupling from QNN SDK.
+  // libqnn_context.so exports ml_train_context_pluggable symbol.
+  try {
+    registerContext("libqnn_context.so", "");
+  } catch (std::exception &e) {
+    ml_logw("QNN context plugin not available: %s", e.what());
+  }
 #endif
 }
 
@@ -62,7 +93,7 @@ void Engine::initialize() noexcept {
   }
 };
 
-void Engine::release() { thread_pool_manager_.reset(); }
+void Engine::release() {}
 
 std::string
 Engine::parseComputeEngine(const std::vector<std::string> &props) const {
@@ -167,19 +198,19 @@ int Engine::registerContext(const std::string &library_path,
   NNTR_THROW_IF_CLEANUP(type == "", std::invalid_argument, close_dl)
     << func_tag << "custom layer must specify type name, but it is empty";
 
+  // If this type is already registered (e.g. called again for a second
+  // sub-model in a multi-model handle), free the newly-created context
+  // immediately rather than leaking it. The name-based overload is the
+  // authoritative synchronized check; this is just an early-exit path.
+  if (engines.find(type) != engines.end()) {
+    pluggable->destroyfunc(context);
+    DynamicLibraryLoader::freeLibrary(handle);
+    return 0;
+  }
+
   registerContext(type, context);
 
   return 0;
-}
-
-ThreadPoolManager *Engine::getThreadPoolManager() {
-  std::lock_guard<std::mutex> lock(thread_pool_manager_mutex_);
-
-  if (!thread_pool_manager_) {
-    thread_pool_manager_ = std::make_unique<ThreadPoolManager>();
-  }
-
-  return thread_pool_manager_.get();
 }
 
 } // namespace nntrainer

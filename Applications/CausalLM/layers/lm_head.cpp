@@ -50,6 +50,9 @@ void LmHeadLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<nntrainer::props::DisableBias>(*layer_impl_props);
 
   auto unit = std::get<nntrainer::props::Unit>(lmhead_props).get();
+  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
 
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "lm head layer takes only one input";
@@ -119,8 +122,11 @@ void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
-  nntrainer::Tensor weight =
+  nntrainer::Tensor &weight =
     context.getWeight(weight_idx[LmHeadParams::weight]);
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);

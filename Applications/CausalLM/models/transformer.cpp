@@ -11,6 +11,7 @@
  */
 
 #include <fstream>
+#include <mutex>
 
 #include <app_context.h>
 #include <engine.h>
@@ -22,11 +23,27 @@
 
 #include <embedding_layer.h>
 #include <mha_core.h>
+#include <neuralnet.h>
+#include <qs4cx_tensor.h>
 #include <rms_norm.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
 namespace causallm {
+
+/**
+ * @brief Load a file as a binary string.
+ */
+ml::train::ModelFormat
+Transformer::formatFromExtension(const std::string &weight_path) {
+  const auto dot = weight_path.find_last_of('.');
+  if (dot != std::string::npos) {
+    const std::string ext = weight_path.substr(dot + 1);
+    if (ext == "safetensors")
+      return ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
+  }
+  return ml::train::ModelFormat::MODEL_FORMAT_BIN;
+}
 
 std::string LoadBytesFromFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -43,6 +60,9 @@ std::string LoadBytesFromFile(const std::string &path) {
   return buffer;
 }
 
+/**
+ * @brief Convert model_type text from config to ModelType.
+ */
 ModelType strToModelType(std::string model_type) {
 
   std::string model_type_lower = model_type;
@@ -62,6 +82,9 @@ ModelType strToModelType(std::string model_type) {
   return model_type_map.at(model_type_lower);
 }
 
+/**
+ * @brief Construct a Transformer and initialize shared config state.
+ */
 Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
                          ModelType model_type) {
 
@@ -78,15 +101,31 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
                              ", Config Type: " + config_model_type_str);
   }
 
-  // Initialize the model with the provided configurations
-  // This is where you would set up the model layers, parameters, etc.
-  setupParameters(cfg, generation_cfg, nntr_cfg);
+  const bool skip_tokenizer = nntr_cfg.contains("skip_tokenizer") &&
+                              nntr_cfg["skip_tokenizer"].get<bool>();
 
-  // prep tokenizer
-  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  // Initialize the model with the provided configurations. Vision models such
+  // as TimmViT defer this to their derived constructor because the base
+  // Transformer setup expects text-model fields.
+  if (!(skip_tokenizer && model_type == ModelType::MODEL)) {
+    setupParameters(cfg, generation_cfg, nntr_cfg);
+  }
+
+  // Skip tokenizer if specified, or when no tokenizer_file is configured
+  // (e.g. vision-encoder sub-models composed into a multimodal handle, whose
+  // config carries no tokenizer). Avoids a json type_error on a null path.
+  if (skip_tokenizer || !nntr_cfg.contains("tokenizer_file") ||
+      nntr_cfg["tokenizer_file"].is_null()) {
+    tokenizer = nullptr; // No tokenizer for this model
+  } else {
+    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  }
 };
 
+/**
+ * @brief Set common transformer parameters from model configs.
+ */
 void Transformer::setupParameters(json &cfg, json &generation_cfg,
                                   json &nntr_cfg) {
 
@@ -103,16 +142,27 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
+  PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
-  } else if (cfg.contains("use_bidirectional_attention")) {
+  } else if (cfg.contains("use_bidirectional_attention") &&
+             !cfg["use_bidirectional_attention"].is_null()) {
     IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
+  } else if (nntr_cfg.contains("model_type") &&
+             strToModelType(nntr_cfg["model_type"].get<std::string>()) ==
+               ModelType::EMBEDDING &&
+             cfg.contains("architectures") && cfg["architectures"].is_array() &&
+             !cfg["architectures"].empty() &&
+             cfg["architectures"][0].get<std::string>() == "Qwen2Model") {
+    IS_CAUSAL = false;
   }
 
   NUM_VOCAB = cfg["vocab_size"];
   DIM = cfg["hidden_size"];
-  INTERMEDIATE_SIZE = cfg["intermediate_size"];
+  INTERMEDIATE_SIZE =
+    cfg.contains("intermediate_size") ? cfg["intermediate_size"].get<int>() : 0;
   NUM_LAYERS = cfg["num_hidden_layers"];
   NUM_HEADS = cfg["num_attention_heads"];
   HEAD_DIM = cfg.contains("head_dim")
@@ -129,23 +179,39 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                              ? cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
   MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
-  ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
-  TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
-  NORM_EPS = cfg["rms_norm_eps"];
+  if (cfg.contains("rope_theta")) {
+    ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
+  } else if (cfg.contains("rope_parameters") &&
+             cfg["rope_parameters"].contains("rope_theta")) {
+    ROPE_THETA = cfg["rope_parameters"]["rope_theta"].get<unsigned int>();
+  } else if (cfg.contains("rope_parameters") &&
+             cfg["rope_parameters"].contains("sliding_attention")) {
+    json &rope_cfg = cfg["rope_parameters"]["sliding_attention"];
+    ROPE_THETA = rope_cfg.value("rope_theta", 10000);
+  } else {
+    ROPE_THETA = cfg.value("rope_theta", 10000);
+  }
+  TIE_WORD_EMBEDDINGS = cfg.contains("tie_word_embeddings")
+                          ? cfg["tie_word_embeddings"].get<bool>()
+                          : false;
+  NORM_EPS =
+    cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>() : 1e-5;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
   return;
 };
 
+/**
+ * @brief Build and compile the symbolic transformer graph.
+ */
 void Transformer::initialize() {
 
   // RegisterCustomLayers
   registerCustomLayers();
 
-  // construct causalLM model
-  constructModel();
+  // create model and apply properties before compile()
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
 
-  // setup model property
   std::vector<std::string> model_props = {
     withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
     withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
@@ -153,75 +219,80 @@ void Transformer::initialize() {
     model_props.emplace_back(withKey("fsu", "true"));
     model_props.emplace_back(withKey("fsu_lookahead", FSU_LOOKAHEAD));
   }
-
   model->setProperty(model_props);
 
-  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {
+  // build symbolic tensor graph and compile from (input, output)
+  auto [x, y] = constructModel();
+
+  if (model->compile(x, y, ml::train::ExecutionMode::INFERENCE)) {
     throw std::invalid_argument("Model compilation failed.");
   }
 
-  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
-    throw std::invalid_argument("Model initialization failed.");
-  }
-
   is_initialized = true;
-
 #ifdef DEBUG
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 #endif
 }
 
-void Transformer::constructModel() {
+/**
+ * @brief Construct the default decoder-only transformer graph.
+ */
+std::pair<Tensor, Tensor> Transformer::constructModel() {
 
-  // layers used in the model
-  std::vector<LayerHandle> layers;
+  // input
+  Tensor x =
+    Tensor({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
 
-  // create model
-  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
-
-  // create input layer
-  layers.push_back(createLayer(
-    "input", {withKey("name", "input0"),
-              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
-
-  // create embedding layer
+  // embedding
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
-  layers.push_back(createLayer(
+  NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires untied embedding_layer";
+  LayerHandle embedding(createLayer(
     embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+    buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
+                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
+  Tensor h = embedding(x);
 
-  // create transformer layers
+  // transformer decoder blocks
   for (int i = 0; i < NUM_LAYERS; ++i) {
-    std::vector<LayerHandle> transformer;
-    if (i == 0)
-      transformer = createTransformerDecoderBlock(0, "embedding0");
-    else
-      transformer = createTransformerDecoderBlock(
-        i, "layer" + std::to_string(i - 1) + "_decoder_output");
-    layers.insert(layers.end(), transformer.begin(), transformer.end());
+    h = createTransformerDecoderBlock(i, h);
   }
 
-  // create rms_norm
-  layers.push_back(createLayer(
-    "rms_norm",
-    {withKey("name", "output_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("input_layers",
-             "layer" + std::to_string(NUM_LAYERS - 1) + "_decoder_output"),
-     withKey("packed", "false")}));
+  // final rms_norm
+  LayerHandle out_norm(
+    createLayer("rms_norm", {withKey("name", "output_norm"),
+                             withKey("epsilon", std::to_string(NORM_EPS)),
+                             withKey("packed", "false")}));
+  h = out_norm(h);
 
-  // add created layers into the model
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
+  return {x, h};
 };
 
-void Transformer::load_weight(const std::string &weight_path) {
+std::vector<std::string> Transformer::buildEmbeddingLayerProperties(
+  const std::string &name, unsigned int in_dim, unsigned int out_dim,
+  const std::string &weight_dtype, float scale,
+  const std::string &quantized_lut_path) const {
+  std::vector<std::string> props = {
+    withKey("name", name),
+    withKey("in_dim", std::to_string(in_dim)),
+    withKey("weight_dtype", weight_dtype),
+    withKey("out_dim", std::to_string(out_dim)),
+    withKey("scale", std::to_string(scale)),
+  };
 
+  if (!quantized_lut_path.empty())
+    props.emplace_back(withKey("quantized_lut_path", quantized_lut_path));
+
+  return props;
+}
+
+/**
+ * @brief Load model weights from a binary nntrainer model file.
+ */
+void Transformer::load_weight(const std::string &weight_path) {
   if (!is_initialized) {
     throw std::runtime_error(
       "Transformer model is not initialized. Please call "
@@ -229,13 +300,16 @@ void Transformer::load_weight(const std::string &weight_path) {
   }
 
   try {
-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    model->load(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to load model weights: " +
                              std::string(e.what()));
   }
 };
 
+/**
+ * @brief Save model weights to a binary nntrainer model file.
+ */
 void Transformer::save_weight(const std::string &weight_path) {
 
   if (!is_initialized) {
@@ -245,13 +319,63 @@ void Transformer::save_weight(const std::string &weight_path) {
   }
 
   try {
-    model->save(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+    model->save(weight_path, formatFromExtension(weight_path));
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to save model weights: " +
                              std::string(e.what()));
   }
 };
 
+/**
+ * @brief Save model weights with optional dtype conversion.
+ */
+void Transformer::save_weight(
+  const std::string &weight_path, ml::train::TensorDim::DataType dtype,
+  const std::map<std::string, ml::train::TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
+
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before save_weight().");
+  }
+
+  try {
+    model->save(weight_path, formatFromExtension(weight_path), dtype,
+                layer_dtype_map, target_isa);
+
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to save model weights with dtype: " +
+                             std::string(e.what()));
+  }
+};
+
+/**
+ * @brief Repack all QS4CX weights after loading.
+ */
+void Transformer::repack_weight() {
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before repack_weight().");
+  }
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      // Each layer determines whether it repacks its own weights or not
+      static_cast<nntrainer::LayerNode &>(l).pack(context);
+    };
+  try {
+    model->forEachLayer(fn, nullptr);
+    ml_logd("weights repacked successfully");
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to repack weights: " +
+                             std::string(e.what()));
+  }
+};
+
+/**
+ * @brief Run a transformer model for a prompt.
+ */
 void Transformer::run(const WSTR prompt, bool do_sample,
                       const WSTR system_prompt, const WSTR tail_prompt,
                       bool log_output) {
@@ -264,157 +388,187 @@ void Transformer::run(const WSTR prompt, bool do_sample,
   /// The run action can be defined by the precedent classes.
 }
 
-std::vector<LayerHandle>
-Transformer::createTransformerDecoderBlock(const int layer_id,
-                                           std::string input_name) {
+/**
+ * @brief Create one decoder block with attention and feed-forward layers.
+ */
+Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
+                                                  Tensor input) {
 
-  std::vector<LayerHandle> layers;
-
-  layers.push_back(createLayer(
+  LayerHandle attn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("input_layers", input_name),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
+  Tensor normed = attn_norm(input);
 
-  auto att_layer =
-    createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm",
-                    "layer" + std::to_string(layer_id) + "_attention_norm");
+  Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
+                                   normed, normed, normed);
 
-  layers.insert(layers.end(), att_layer.begin(), att_layer.end());
-
-  layers.push_back(createLayer(
+  LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
-     withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) +
-                               "_attention_out")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+  Tensor residual = decoder_add({input, att_out});
 
-  layers.push_back(createLayer(
+  LayerHandle ffn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_decoder_add"),
      withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("packed", "false")}));
+  Tensor ffn_normed = ffn_norm(residual);
 
-  auto ffn_layer = createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
-                             "layer" + std::to_string(layer_id) + "_ffn_norm");
-  layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
+  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
-  layers.push_back(createLayer(
+  LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_decoder_add,layer" + std::to_string(layer_id) +
-                               "_ffn_down")}));
-
-  return layers;
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+  return decoder_output({residual, ffn_out});
 }
 
-std::vector<LayerHandle>
-Transformer::createAttention(const int layer_id, int seq_len, int n_heads,
-                             int head_dim, std::string query_name,
-                             std::string key_name, std::string value_name) {
+/**
+ * @brief Create external KV-cache placeholder tensors for one layer.
+ */
+std::pair<Tensor, Tensor>
+Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
+  const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+  const unsigned int kv_width =
+    static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
+  const std::string cache_shape = std::to_string(BATCH_SIZE) +
+                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  std::to_string(kv_width);
 
-  std::vector<LayerHandle> layers;
+  // KV caches MUST be created as "input" layers (not plain Tensors). Plain
+  // Tensors shrink the graph's input-layer set, which changes the tensor-pool
+  // in-place/flatten behavior so that the first transformer layer's input is no
+  // longer a synced dependent of the model input placeholder. On ARM that broke
+  // USE_EMBEDDING prefill: the embedding reached input0's output but never
+  // layer0_conv_norm (all-zero activations → <pad>). The x86 (#else) path
+  // always used input layers and worked; this keeps both paths symmetric,
+  // differing only in the external dtype (FP16 on ARM, UINT16 elsewhere).
+#ifdef ENABLE_FP16
+  const char *cache_dtype = "FP16";
+#else
+  const char *cache_dtype = "UINT16";
+#endif
 
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+  LayerHandle cache_k_input(createLayer(
+    "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", cache_dtype)}));
+  LayerHandle cache_v_input(createLayer(
+    "input", {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+              withKey("input_shape", cache_shape),
+              withKey("input_dtype", cache_dtype)}));
+
+  return {cache_k_input(Tensor()), cache_v_input(Tensor())};
+}
+
+/**
+ * @brief Create the default attention subgraph.
+ */
+Tensor Transformer::createAttention(const int layer_id, int seq_len,
+                                    int n_heads, int head_dim, Tensor query,
+                                    Tensor key, Tensor value) {
 
   // Q layer
-  std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", head_dim * n_heads),
-    withKey("disable_bias", "true"), withKey("input_layers", query_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", q_params));
+  LayerHandle wq(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")}));
+  Tensor q = wq(query);
 
   // K layer
-  std::vector<std::string> k_params = {
-    withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", key_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", k_params));
+  LayerHandle wk(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  Tensor k = wk(key);
 
   // V layer
-  std::vector<std::string> v_params = {
-    withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", value_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", v_params));
+  LayerHandle wv(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  Tensor v = wv(value);
+
+  // External KV cache placeholders (per-layer). Their actual storage is owned
+  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
   // Attention core layer
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                ? SLIDING_WINDOW
-                                : UINT_MAX),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("is_causal", IS_CAUSAL ? "true" : "false"),
-    withKey("input_layers", {Q, K, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
+                                 ? SLIDING_WINDOW
+                                 : UINT_MAX),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+  Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
-  std::vector<std::string> o_params = {
-    withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", o_params));
-
-  return layers;
+  LayerHandle wo(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+     withKey("unit", DIM), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")}));
+  return wo(a);
 }
 
-std::vector<LayerHandle> Transformer::createMlp(const int layer_id, int dim,
-                                                int hidden_dim,
-                                                std::string input_name) {
+/**
+ * @brief Create the default feed-forward subgraph.
+ */
+Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
+                              Tensor input) {
 
-  std::vector<LayerHandle> layers;
-
-  layers.push_back(createLayer(
+  LayerHandle ffn_up(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name),
      withKey("weight_initializer", "ones")}));
-  layers.push_back(createLayer(
+  Tensor up = ffn_up(input);
+
+  LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("input_layers", input_name),
      withKey("weight_initializer", "ones")}));
+  Tensor gate = ffn_gate(input);
 
-  layers.push_back(createLayer(
+  /// @note nntrainer binary stores mlp weights in up, gate order.
+  /// For backward compatibility,
+  /// * layers are in up, gate order
+  /// * swiglu input[0] = gate
+  /// * swiglu input[1] = up
+  LayerHandle swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_gate," +
-                               "layer" + std::to_string(layer_id) +
-                               "_ffn_up")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
+  Tensor act = swiglu({up, gate}, {1, 0});
 
-  layers.push_back(createLayer(
+  LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
      withKey("weight_initializer", "ones")}));
-
-  return layers;
+  return ffn_down(act);
 }
 
+/**
+ * @brief Register custom CausalLM layers in the nntrainer app context.
+ */
 void Transformer::registerCustomLayers() {
-  ///
-  const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  static std::once_flag registered;
+  std::call_once(registered, []() {
+    const auto &ct_engine = nntrainer::Engine::Global();
+    const auto app_context = static_cast<nntrainer::AppContext *>(
+      ct_engine.getRegisteredContext("cpu"));
 
-  try {
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
@@ -424,11 +578,7 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
-
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  });
 }
 
 } // namespace causallm

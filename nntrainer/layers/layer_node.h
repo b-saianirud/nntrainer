@@ -422,6 +422,14 @@ public:
   bool supportBackwarding() const { return getLayer()->supportBackwarding(); }
 
   /**
+   * @brief     Pack the underlying layer's weights
+   * @details   Delegates to the wrapped layer so each layer type decides how
+   *            (and whether) to repack its own weights.
+   * @param     context Run context bound to this node
+   */
+  void pack(RunLayerContext &context) { getLayer()->pack(context); }
+
+  /**
    * Support interfaces for the properties intercepted from layer
    */
 
@@ -778,11 +786,14 @@ public:
    * @param fsu fsu type
    * @param mode Execution mode
    * @param opt_var read optimizer variables
+   * @param file_fd long-lived backing file descriptor; required for virtual
+   *        tensors (e.g. SlimMoE expert weights) so they can mmap themselves
+   *        in activate() after the per-thread mmap source is unmapped.
    */
   void read(ReadSource src, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
             bool fsu = false, size_t start_offset = 0,
-            bool read_from_offset = false);
+            bool read_from_offset = false, int file_fd = -1);
 
   /**
    * @brief         save layer Weight & Bias data from file
@@ -790,10 +801,13 @@ public:
    * @param opt_var save optimizer variables
    * @param mode    execution mode
    * @param target_dtype target data type to convert weights before saving
+   * @param target_isa target ISA (Instruction Set Architecture) format for
+   * quantization (DEFAULT/X86/ARM)
    */
   void save(std::ofstream &file, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
-            TensorDim::DataType target_dtype = TensorDim::DataType::NONE) const;
+            TensorDim::DataType target_dtype = TensorDim::DataType::NONE,
+            ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const;
 
   /**
    * @brief clear optimizer variable to initial state
@@ -1050,7 +1064,8 @@ properties in the context/graph unless intended. */
                std::vector<props::InputConnection>,
                std::vector<props::InputShape>, props::SharedFrom,
                props::ClipGradByGlobalNorm, props::Packed, props::WeightDtype,
-               props::LossScaleForMixed, props::ComputeEngine>;
+               props::InputDtype, props::LossScaleForMixed,
+               props::ComputeEngine>;
 
   using RealizationPropsType = std::tuple<props::Flatten, props::Activation>;
   /** these realization properties results in addition of new layers, hence

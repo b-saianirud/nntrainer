@@ -16,8 +16,6 @@ if get_option('platform') == 'android'
       arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
     elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
       arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
-    elif arm_arch_opt == 'armv7l'
-      arm_march_flag = '-march=armv7-a+neon'
     endif
   endif
   if arm_march_flag != ''
@@ -38,6 +36,17 @@ and_conf.set('MESON_NNTRAINER_INCS', ' '.join(nntrainer_inc_abs))
 and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
+
+# ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk:
+# they gate the _FP16 type in the public headers (tensor_dim.h), so apps that
+# link the prebuilts must compile with the same values.
+nntrainer_abi_defines = []
+foreach define : extra_defines
+  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1'
+    nntrainer_abi_defines += define
+  endif
+endforeach
+and_conf.set('NNTRAINER_ABI_DEFINES', ' '.join(nntrainer_abi_defines))
 
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])
@@ -76,6 +85,18 @@ else
   and_conf.set('MESON_CL_ROOT', '')
 endif
 
+if get_option('enable-htp')
+  # Wire libsdkl.so into ndk-build as a PREBUILT_SHARED_LIBRARY.
+  # hexkl_lib_dir is set in the top-level meson.build HTP block and is in scope.
+  and_conf.set('MESON_ENABLE_HEXKL', 1)
+  and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', hexkl_root / 'include')
+else
+  and_conf.set('MESON_ENABLE_HEXKL', 0)
+  and_conf.set('MESON_HEXKL_LIB_DIR', '')
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', '')
+endif
+
 if tflite_dep.found()
   and_conf.set('MESON_HAS_TFLITE', 1)
   and_conf.set('MESON_TFLITE_ROOT', tflite_root)
@@ -98,11 +119,26 @@ else
   error('ml api common dep is needed for the android build')
 endif
 
+if get_option('enable-npu')
+  and_conf.set('MESON_ENABLE_NPU', 1)
+  and_conf.set('MESON_QNN_SRCS', ' '.join(qnn_sources_abs))
+  and_conf.set('MESON_QNN_INCS', ' '.join(qnn_inc_abs))
+else
+  and_conf.set('MESON_ENABLE_NPU', 0)
+  and_conf.set('MESON_QNN_SRCS', '')
+  and_conf.set('MESON_QNN_INCS', '')
+endif
+
 configure_file(input: 'Android.mk.in', output: 'Android.mk',
   configuration: and_conf
 )
 
-install_data(sources: 'Android-prebuilt.mk', rename: 'Android.mk', install_dir: nntrainer_prefix)
+android_prebuilt_mk = configure_file(input: 'Android-prebuilt.mk.in',
+  output: 'Android-prebuilt.mk',
+  configuration: and_conf
+)
+
+install_data(android_prebuilt_mk, rename: 'Android.mk', install_dir: nntrainer_prefix)
 
 configure_file(input: 'Application.mk', output: 'Application.mk',
   copy: true

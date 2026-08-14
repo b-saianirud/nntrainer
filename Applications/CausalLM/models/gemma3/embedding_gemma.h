@@ -3,6 +3,7 @@
  * Copyright (C) 2026 SeungBaek Hong <sb92.hong@samsung.com>
  *
  * @file   embedding_gemma.h
+ * @brief  Gemma3-based embedding model.
  * @date   11 Jan 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>

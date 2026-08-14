@@ -133,20 +133,42 @@ public:
 
   /**
    * @brief     Constructor of Manager
+   *
+   * @param allocator backend allocator from the engine's Context
+   *        (CPU / SVM / RPC). Forwarded into both the weight and the
+   *        tensor pools so all dynamically requested memory comes
+   *        from the same source. Default = host CPU memory.
    */
   Manager(bool enable_fsu_, const std::string &fsu_path = "",
           unsigned int lookahead = 0, const std::string tensor_format_ = "NCHW",
           const std::string tensor_dtype_ = "FP32-FP32",
-          ExecutionMode exec_mode_ = ExecutionMode::TRAIN) :
-    weight_pool(enable_fsu_, fsu_path, "weight_pool", exec_mode_),
+          ExecutionMode exec_mode_ = ExecutionMode::TRAIN,
+          std::shared_ptr<MemAllocator> allocator =
+            std::make_shared<MemAllocator>()) :
+    weight_pool(enable_fsu_, fsu_path, "weight_pool", exec_mode_, allocator),
     tensor_pool(enable_fsu_ && (exec_mode_ == ExecutionMode::TRAIN), fsu_path,
-                "tensor_pool", exec_mode_),
+                "tensor_pool", exec_mode_, allocator),
     enable_fsu(enable_fsu_),
     enable_optimizations(true),
     fsu_lookahead(lookahead),
     tensor_format(tensor_format_),
     tensor_dtype(split(tensor_dtype_, getRegex("\\-"))),
     exec_mode(exec_mode_) {}
+
+  /**
+   * @brief Route the weight / activation pools to specific backend allocators.
+   * @note  nullptr leaves that pool's allocator unchanged. Must be called
+   *        BEFORE allocateTensors()/allocateWeights(). Used to put ONLY the
+   *        activation pool on the QNN rpcmem allocator while weights stay on
+   *        CPU (weights are not DSP-registered, and rpcmem/CMA is scarce).
+   */
+  void setComputeBackend(std::shared_ptr<MemAllocator> weight_allocator,
+                         std::shared_ptr<MemAllocator> tensor_allocator) {
+    if (weight_allocator != nullptr)
+      weight_pool.setAllocator(std::move(weight_allocator));
+    if (tensor_allocator != nullptr)
+      tensor_pool.setAllocator(std::move(tensor_allocator));
+  }
 
   /**
    * @brief Move Construct a new Manager object

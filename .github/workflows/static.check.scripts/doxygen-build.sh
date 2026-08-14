@@ -68,7 +68,7 @@ for file in `cat $files`; do
   fi
 
   # Handle only a source code sequentially in case that there are lots of files in one commit.
-  if [[ `file $file | grep "ASCII text" | wc -l` -gt 0 ]]; then
+  if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
     case $file in
       # In case of source code
       *.c | *.cpp | *.cc | *.hh | *.h | *.hpp | *.py | *.sh | *.php | *.java)

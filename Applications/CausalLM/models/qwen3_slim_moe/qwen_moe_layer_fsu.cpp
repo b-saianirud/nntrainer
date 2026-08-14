@@ -26,9 +26,9 @@
 #include <algorithm>
 #include <cmath>
 #include <node_exporter.h>
-#include <omp.h>
 #include <qwen_moe_layer_fsu.h>
 #include <stdexcept>
+#include <thread_manager.h>
 
 namespace causallm {
 
@@ -187,11 +187,15 @@ void SlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
   auto topk_indices = std::get<1>(topk_result);
 
   const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-#pragma omp parallel for collapse(2)
-  for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-    for (int k = 0; k < static_cast<int>(topk); ++k) {
-      expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-    }
+  {
+    auto &tm = nntrainer::ThreadManager::Global();
+    size_t total_iters =
+      static_cast<size_t>(total_tokens) * static_cast<size_t>(topk);
+    tm.parallel_for(0, static_cast<size_t>(total_iters), [&](size_t idx) {
+      int k = idx % topk;
+      int i = idx / topk;
+      expert_mask.setValue(indices_data[idx], 0, k, i, 1.0f);
+    });
   }
 
   // Pre-compute expert token assignments for better cache locality
@@ -287,14 +291,11 @@ inline void SlimMoELayer::compute_expert_forward(
     // Gate projection using optimized dot operation
     token_input.dot(gate_proj, gate_out);
 
-    // Apply activation (silu)
-    acti_func.run_fn(gate_out, acti_out);
-
     // Up projection using optimized dot operation
     token_input.dot(up_proj, up_out);
 
-    // Element-wise multiply: silu(gate_out) * up_out
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
@@ -352,14 +353,11 @@ inline void SlimMoELayer::compute_expert_forward_no_critical(
     // Gate projection using optimized dot operation
     token_input.dot(gate_proj, gate_out);
 
-    // Apply activation (silu)
-    acti_func.run_fn(gate_out, acti_out);
-
     // Up projection using optimized dot operation
     token_input.dot(up_proj, up_out);
 
-    // Element-wise multiply: silu(gate_out) * up_out
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     // Down projection using optimized dot operation
     nntrainer::Tensor token_expert_output(token_output_dim);
@@ -450,7 +448,10 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-#pragma omp parallel for schedule(dynamic)
+    // Serial outer loop: the expert GEMV/GEMM parallelizes internally via
+    // ThreadManager (dot() calls parallel_for), and nesting parallel_for
+    // deadlocks because ThreadManager::parallelize() uses a non-recursive
+    // execution_mutex_.
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];
@@ -458,10 +459,10 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         continue;
 
       ///@note Please note that expert_gate_proj is virtual tensor,
-      ///      which is not allocated so far. It will be allocated when it is
-      ///      used. `activate(read=true)` will allocate its memory and will
-      ///      read from the original weight. activate is true by default. i.e.,
-      ///      mmap
+      ///      which is not allocated so far. It will be allocated when it
+      ///      is used. `activate(read=true)` will allocate its memory and
+      ///      will read from the original weight. activate is true by
+      ///      default. i.e., mmap
       context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
       context.getWeight(expert_up_proj_indices[expert_idx]).activate();
       context.getWeight(expert_down_proj_indices[expert_idx]).activate();
@@ -472,9 +473,9 @@ void SlimMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         context.getWeight(expert_up_proj_indices[expert_idx]),
         context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
 
-      ////@note Please note that the virtual tensor is deactivated after usage
-      ////      This will allocate and load data from the storage on-the-fly
-      ////      i.e., unmap
+      ////@note Please note that the virtual tensor is deactivated after
+      /// usage This will allocate and load data from the storage on-the-fly
+      /// i.e., unmap
       context.getWeight(expert_gate_proj_indices[expert_idx]).deactivate();
       context.getWeight(expert_up_proj_indices[expert_idx]).deactivate();
       context.getWeight(expert_down_proj_indices[expert_idx]).deactivate();

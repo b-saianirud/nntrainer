@@ -1,148 +1,241 @@
-# NNtrainer
+<p align="center">
+  <h1 align="center">NNTrainer</h1>
+  <p align="center">
+    <strong>On-Device AI Training & LLM Inference Framework</strong><br/>
+    Run 30B+ LLMs on your phone. Train models without the cloud.
+  </p>
+</p>
 
-[![Code Coverage](https://img.shields.io/endpoint?url=https://nntrainer.github.io/coverage_result/coverage.json)](https://nntrainer.github.io/coverage_result/)
-[![DailyBuild](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml)
-![GitHub repo size](https://img.shields.io/github/repo-size/nnstreamer/nntrainer)
-![GitHub issues](https://img.shields.io/github/issues/nnstreamer/nntrainer)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/nnstreamer/nntrainer)
-<a href="https://scan.coverity.com/projects/nnstreamer-nntrainer">
-  <img alt="Coverity Scan Build Status"
-       src="https://scan.coverity.com/projects/22512/badge.svg"/>
-</a>
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/9179/badge)](https://www.bestpractices.dev/projects/9179)
+<p align="center">
+  <a href="https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml"><img src="https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg" alt="DailyBuild"/></a>
+  <a href="https://nntrainer.github.io/coverage_result/"><img src="https://img.shields.io/endpoint?url=https://nntrainer.github.io/coverage_result/coverage.json" alt="Code Coverage"/></a>
+  <a href="https://scan.coverity.com/projects/nnstreamer-nntrainer"><img src="https://scan.coverity.com/projects/22512/badge.svg" alt="Coverity Scan Build Status"/></a>
+  <a href="https://www.bestpractices.dev/projects/9179"><img src="https://www.bestpractices.dev/projects/9179/badge" alt="OpenSSF Best Practices"/></a>
+  <img src="https://img.shields.io/github/repo-size/nnstreamer/nntrainer" alt="GitHub repo size"/>
+  <img src="https://img.shields.io/github/issues/nnstreamer/nntrainer" alt="GitHub issues"/>
+  <img src="https://img.shields.io/github/issues-pr/nnstreamer/nntrainer" alt="GitHub pull requests"/>
+</p>
 
-NNtrainer is a Software Framework for training/Inference of Neural Network models on devices.
+---
 
-## Overview
+## Run 30B MoE LLMs on a Mobile Phone
 
-NNtrainer is an Open Source Project. The aim of the NNtrainer is to develop a Software Framework to train and run inference of neural network models on embedded devices which have relatively limited resources.
+NNTrainer makes it possible to run large-scale Mixture-of-Experts LLMs directly on mobile devices using **Flash Storage Utilization (FSU)** — loading experts on-the-fly from flash storage instead of keeping the entire model in memory.
 
-**Training**: Rather than training whole layers of a network from the scratch, NNtrainer finetunes the neural network model on device with user data for the personalization.
-
-**Inference**: NNtrainer supports efficient LLM inference on memory-constrained devices through advanced memory optimization techniques:
-- **FSU (Flash Storage Utilization)**: Dynamically loads model weights from flash storage during inference, significantly reducing peak memory usage.
-- **MoE Cache**: Intelligent caching mechanism for Mixture of Experts models, keeping frequently used experts in memory while swapping others to storage.
-- **Proactive Loading**: Predicts and pre-loads required weights before they are needed, minimizing latency during inference.
-
-Even if NNtrainer runs on device, it provides full functionalities to train and infer models and also utilizes limited device resources efficiently. NNTrainer supports various machine learning algorithms such as k-Nearest Neighbor (k-NN), Neural Networks, Logistic Regression, Reinforcement Learning algorithms, Recurrent network, Transformers (LLM) and more. We also provide examples for various tasks such as Few-shot learning, ResNet, VGG, Product Rating, LLM Inference and more will be added. All of these were tested on Samsung Galaxy smart phone with Android and PC (Ubuntu).
-
-[ Memory-Efficient LLM Inference on Edge Devices With NNTrainer ](https://youtu.be/J2tUmi4bwMY?si=rJyiXkwr5iFrMhIK), Open Source Summit 2025 Seoul <br />
-[ A New Frontier of AI: On-Device AI Training and Personalization ](https://dl.acm.org/doi/abs/10.1145/3639477.3639716), ICSE-SEIP, 2024 <br />
-[ NNTrainer: Light-Weight On-Device Training Framework ](https://arxiv.org/pdf/2206.04688.pdf), arXiv, 2022 <br />
-[  Open Source On-Device AI SW Platform ](https://youtu.be/im3uNrPLYx4?si=gMbw7LKKSnpXi59U), Samsung Developer Conference 2023 (Korean) <br />
-[ NNTrainer: Personalize neural networks on devices! ](https://www.youtube.com/watch?v=HKKowY78P1A), Samsung Developer Conference 2021 <br />
-[ NNTrainer: "On-device learning" ](https://www.youtube.com/embed/Jy_auavraKg?start=4035&end=4080), Samsung AI Forum 2021
-
-## ✨ Key Features
-
-- 📱 **Run Locally, Fully Offline**: Perform training and inference directly on your edge devices without any internet connection. Ensure data privacy and low latency.
-- 🛠️ **On-Device Training & Personalization**: Fine-tune models on-device with private user data. Supports Transfer Learning, Few-Shot Learning, and Continuous Learning scenarios.
-- 🚀 **Efficient LLM Inference**: Run Large Language Models on memory-constrained devices. Features **Flash Storage Utilization (FSU)** to offload weights and **MoE Cache** for efficient Mixture-of-Experts execution.
-- 🤖 **Broad Model Support**: Built-in support for various architectures including CNNs (ResNet, VGG), RNNs (LSTM, GRU), Transformers (LLaMA, Qwen, DeepSeek), and Reinforcement Learning.
-- ⚡ **High Performance & Lightweight**: Optimized for embedded systems. Functionalities are designed to minimize memory footprint and maximize execution speed on ARM, x86, and NPU targets.
-- 🔌 **Cross-Platform**: Deploy seamlessly across Tizen, Android, Linux, and Windows environments with consistent C/C++ APIs.
-
-
-## 🚀 Running LLMs On Device
-
-NNTrainer supports Large Language Model (LLM) inference! Please refer to `Applications/CausalLM` for details. We currently support various LLM architectures, including:
-  - Qwen3
-  - Qwen3-MoE
-  - GPT-OSS
-  - And more to come!
-
-### Running MoE on your device
-  NNTrainer enables the execution of large-scale Mixture of Experts (MoE) models directly on-device. We support on-the-fly expert loading using flash storage, allowing MoE models to run with significantly reduced peak memory usage.
-  Below are demonstrations of MoE LLMs running on mobile devices:
-
-#### 📱 Running MoE on your mobile phone
-
-| GPT-OSS 20B | Qwen3 MoE 30B-A3B |
-|:-----------:|:-----------------:|
+| GPT-OSS 20B on Mobile | Qwen3 MoE 30B-A3B on Mobile |
+|:----------------------:|:----------------------------:|
 | <img src="docs/videos/GPT_OSS_20B_Demo.gif" width="360"> | <img src="docs/videos/Qwen_30B_Demo.gif" width="360"> |
 
-#### 💻 Running MoE on your PC
+### Memory? Not a problem.
 
- NNTrainer's FSU feature allows for dynamic expert loading during inference. This minimizes initialization time and ensures efficiency in memory-constrained environments. To test this, try the models located in `Applications/CausalLM/models/*-slim`.
+With FSU, NNTrainer loads only the active experts during inference — reducing memory from **16.5 GB down to 1.3 GB** for a 30B-parameter model.
 
-  | Load Whole model (Qwen3-30B-A3B) | Load Expert On-The-Fly (Qwen3-30B-A3B-Slim)|
-  |:-------:|:------:|
-  |![](./docs/videos/moe-full.gif)| ![](./docs/videos/moe-on-the-fly.gif) |
-  | Memory: 16.5 GB | Memory: 1.3 GB |
+| Load Whole Model (Qwen3-30B-A3B) | Load Experts On-The-Fly (Qwen3-30B-A3B-Slim) |
+|:---------------------------------:|:---------------------------------------------:|
+| ![](./docs/videos/moe-full.gif) | ![](./docs/videos/moe-on-the-fly.gif) |
+| Memory: **16.5 GB** | Memory: **1.3 GB** |
 
+> Try it yourself with `Applications/CausalLM/models/*-slim` models.
+
+---
+
+## Applications/CausalLM — LLM Inference Engine
+
+[`Applications/CausalLM`](https://github.com/nntrainer/nntrainer/tree/main/Applications/CausalLM) is NNTrainer's production-ready LLM inference engine optimized for resource-constrained environments.
+
+### Supported Models
+
+| Model | Parameters | Variants |
+|-------|-----------|----------|
+| **Qwen3** | 0.6B, 1.7B, 4B, 8B, 14B, 32B | Standard |
+| **Qwen3-MoE** | 30B-A3B | Full / Slim (FSU) / Cached-Slim |
+| **GPT-OSS** | 20B-A3.6B, 120B-5.1B | Full / Cached-Slim |
+| **Gemma3** | - | Standard |
+| **Qwen2** | - | Standard |
+
+### Core Optimizations
+
+- **FSU (Flash Storage Utilization)** — Dynamically loads weights from flash storage during inference, dramatically reducing peak memory usage
+- **MoE Cache** — Intelligent caching keeps frequently used experts in memory, swapping others to storage
+- **Proactive Loading** — Predicts and pre-loads required weights before they are needed, minimizing latency
+- **Decoupled KV Cache** — Separates query and KV cache computation for efficient attention in long-context scenarios
+
+### Build & Deploy
+
+CausalLM supports multiple deployment targets with ready-to-use build scripts:
+
+```bash
+cd Applications/CausalLM
+
+# Android
+./build_android.sh && ./install_android.sh
+
+# Linux / PC
+meson build && ninja -C build
+```
+
+Includes benchmark tools with thermal monitoring, performance metrics (prefill/generation speed, peak memory), and Android JNI bindings.
+
+---
+
+## On-Device Training — Learn Directly on the Edge
+
+NNTrainer was built from the ground up for **training neural networks on device** — no cloud, no data upload, no privacy risk. User data never leaves the device.
+
+### Training Scenarios
+
+#### Transfer Learning
+Freeze a pre-trained backbone (e.g., MobileNetV2) and fine-tune only the final layers with your own data. Train a custom image classifier with just **15 images** in under a minute on a smartphone.
+
+```
+Pre-trained MobileNetV2 (frozen) → FC(128) → FC(20) → Softmax(3)
+                                   ↑ Only these layers are trained on-device
+```
+
+> See [`Applications/TransferLearning`](Applications/TransferLearning) — CIFAR classification & emotion recognition from hand-drawn images.
+
+#### Few-Shot Learning
+Learn new classes from as few as **1~5 examples** using centroid-based nearest-neighbor classification — no gradient updates needed at deployment time.
+
+> See [`Applications/SimpleShot`](Applications/SimpleShot) — 73% accuracy with just 20 examples per class.
+
+#### Full Model Training
+Train entire CNNs, RNNs, and Transformers from scratch on device. NNTrainer's memory-optimized runtime makes it feasible even on resource-constrained hardware.
+
+> See [`Applications/MNIST`](Applications/MNIST), [`Applications/Resnet`](Applications/Resnet), [`Applications/VGG`](Applications/VGG)
+
+#### Reinforcement Learning
+Complete Deep Q-Learning with experience replay and dual network architecture — tested on Galaxy S9.
+
+> See [`Applications/ReinforcementLearning`](Applications/ReinforcementLearning)
+
+### Training Infrastructure
+
+| Component | Details |
+|-----------|---------|
+| **Optimizers** | SGD, Adam, AdamW |
+| **LR Schedulers** | Constant, Exponential, Step, Cosine Annealing, Linear Decay |
+| **Loss Functions** | Cross-Entropy (Softmax/Sigmoid), MSE, KL Divergence |
+| **Regularization** | L2 Regularization, Dropout, Batch Normalization, Gradient Clipping |
+| **Weight Init** | Xavier, He, LeCun (Normal/Uniform), Zeros |
+| **Activations** | ReLU, GELU, Swish, Sigmoid, Tanh, Softmax, Mish, ELU, SELU, and more |
+| **Data Loading** | File-based datasets or generator callbacks for streaming/augmentation |
+| **Augmentation** | Random flip, translate, L2 normalization (built-in preprocessing layers) |
+| **Export Formats** | Binary, INI, FlatBuffer, ONNX, TFLite |
+
+### Why Train On-Device?
+
+- **Privacy** — Sensitive data (health, biometrics, personal photos) stays on-device. No cloud upload required.
+- **Personalization** — Adapt a generic model to each user's unique patterns and preferences in real-time.
+- **Offline Capability** — Train and improve models without any network connectivity.
+- **Low Latency** — No round-trip to the cloud. Instant feedback loop between data collection and model update.
+
+---
+
+## What's New
+
+| Feature | Description |
+|---------|-------------|
+| **Qwen3 / Qwen3-MoE Support** | Full support for Qwen3 family including 30B MoE with on-device expert loading |
+| **GPT-OSS 120B-5.1B** | Run 120B-parameter MoE models with cached-slim expert loading |
+| **Gemma3 Support** | Google's Gemma3 architecture added to CausalLM |
+| **GGML Quantizer** | Quantize models to reduced precision for smaller footprint and faster inference |
+| **AVX2 GELU / Tanh-GELU** | SIMD-optimized activation kernels for x86_64 |
+| **NEON SwiGLU / GELU** | ARM NEON SIMD optimizations with loop unrolling for mobile performance |
+| **Android Benchmark Suite** | End-to-end benchmarking with thermal monitoring, device utilities, and tokenizer support |
+| **Decoupled KV Cache** | Optimized attention for Qwen3 with separated query and KV cache paths |
+| **MoE Expert Caching** | Cached-slim variants that keep hot experts in memory across inference steps |
+| **Mixed Precision (FP16)** | Half-precision support for reduced memory and accelerated computation |
+| **Windows ARM/x86_64** | Full build support for Windows platforms |
+
+---
+
+## Key Features
+
+- **Run Locally, Fully Offline** — Training and inference on edge devices with zero cloud dependency. Data stays on the device.
+- **On-Device Training & Personalization** — Fine-tune models on-device with private user data. Supports Transfer Learning, Few-Shot Learning, and Continuous Learning.
+- **Efficient LLM Inference** — Run LLMs up to 120B parameters on memory-constrained devices with FSU and MoE caching.
+- **Broad Model Support** — CNNs (ResNet, VGG, AlexNet, YOLO), RNNs (LSTM, GRU), Transformers (Qwen3, GPT-OSS, Gemma3, LLaMA), and Reinforcement Learning.
+- **High Performance** — NEON/AVX2 SIMD, OpenCL GPU, cuBLAS, and NPU acceleration. Optimized memory pool and lazy tensor computation.
+- **Cross-Platform** — Tizen, Android, Linux, Windows with consistent C/C++ APIs.
+
+---
+
+## Applications Gallery
+
+NNTrainer provides **20+ ready-to-run example applications**:
+
+| Category | Examples |
+|----------|----------|
+| **LLM / Transformers** | [CausalLM](Applications/CausalLM) 
+| **Computer Vision** | [ResNet](Applications/Resnet), [VGG](Applications/VGG), [AlexNet](Applications/AlexNet), [YOLOv2](Applications/YOLOv2), [YOLOv3](Applications/YOLOv3), [MNIST](Applications/MNIST) |
+| **Few-Shot / Transfer** | [SimpleShot](Applications/SimpleShot), [TransferLearning](Applications/TransferLearning) |
+| **RL / Classical ML** | [ReinforcementLearning](Applications/ReinforcementLearning), [KNN](Applications/KNN), [LogisticRegression](Applications/LogisticRegression) |
+| **Export / Interop** | [ONNX](Applications/ONNX), [TFLite Export](Applications/TFlite_export) |
+| **Platform** | [Android (Kotlin/Java)](Applications/Android), [Tizen Native](Applications/Tizen_native) |
+
+---
 
 ## Official Releases
 
-|     | [Tizen](http://download.tizen.org/snapshots/tizen/unified/latest/repos/standard/packages/) | [Ubuntu](https://launchpad.net/~nnstreamer/+archive/ubuntu/ppa) |                                                                                      Android/NDK Build                                                                                       |                                                                                                      Windows                                                                                                      |
-| :-- | :--: | :--: |:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
-|     | 7.0M2 and later | 22.04/24.04 |                                                                                             9/P                                                                                              |                                                                                              windows-2022 and later                                                                                               |
-| arm64 | [![Tizen ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) | [![Android](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml) |     [![Windows ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml)      |
-| x86_64 | [![Tizen x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) |                                                                                             N/A                                                                                              | [![Windows x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml) |
-| Publish | [Tizen Repo](http://download.tizen.org/snapshots/tizen/unified/latest/repos/standard/packages/) | [PPA](https://launchpad.net/~nnstreamer/+archive/ubuntu/ppa) |                                                                                              NA                                                                                              |                                                                                                        NA                                                                                                         |
-| API | C (Official) | C/C++ |                                                                                            C/C++                                                                                             |                                                                                                       C/C++                                                                                                       |
+|        | [Tizen](http://download.tizen.org/snapshots/tizen/unified/latest/repos/standard/packages/) | [Ubuntu](https://launchpad.net/~nnstreamer/+archive/ubuntu/ppa) | Android/NDK | Windows |
+| :----- | :--: | :--: | :--: | :--: |
+|        | 7.0M2+ | 22.04 / 24.04 | 9/P | 2022+ |
+| arm64  | [![Tizen ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_arm.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) | [![Android](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_android.yml) | [![Windows ARM](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_arm.yml) |
+| x86_64 | [![Tizen x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_tizen_x86_64.yml) | [![Ubuntu](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build.yml) | N/A | [![Windows x86_64](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml/badge.svg)](https://github.com/nntrainer/nntrainer/actions/workflows/daily_build_windows_x86_64.yml) |
+| API    | C (Official) | C/C++ | C/C++ | C/C++ |
 
-- Ready: CI system ensures build-ability and unit-testing. Users may easily build and execute. However, we do not have automated release & deployment system for this instance.
-- Available: binary packages are released and deployed automatically and periodically along with CI tests.
-- SDK Support: Tizen Studio (7.0 and later)
+- **SDK Support**: Tizen Studio 7.0+
+- **Binary Packages**: Tizen Repo, Ubuntu PPA
+
+---
 
 ## Getting Started
 
-### [Installation](https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md)
+- **[Installation Guide](https://github.com/nntrainer/nntrainer/blob/main/docs/getting-started.md)** — Build & install on Linux, Android, or Windows
+- **[Create Your Model](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-create-model.md)** — Tutorial for building custom models
+- **[Run Examples](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-run-examples.md)** — Step-by-step guide for running applications
+- **[Supported Components](https://github.com/nntrainer/nntrainer/blob/main/docs/components.md)** — Full list of layers, optimizers, loss functions, and activations
+- **[C API Reference](https://github.com/nntrainer/nntrainer/blob/master/api/capi/include/nntrainer.h)** | **[C++ API Reference](https://github.com/nntrainer/nntrainer/blob/master/api/ccapi/include)**
 
-Instructions for installing NNTrainer.
+---
 
-### [Tutorial](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-create-model.md)
+## Publications
 
-Introductions for creating your own model.
+- [Memory-Efficient LLM Inference on Edge Devices With NNTrainer](https://youtu.be/J2tUmi4bwMY?si=rJyiXkwr5iFrMhIK) — Open Source Summit 2025 Seoul
+- [A New Frontier of AI: On-Device AI Training and Personalization](https://dl.acm.org/doi/abs/10.1145/3639477.3639716) — ICSE-SEIP, 2024
+- [NNTrainer: Light-Weight On-Device Training Framework](https://arxiv.org/pdf/2206.04688.pdf) — arXiv, 2022
+- [Open Source On-Device AI SW Platform](https://youtu.be/im3uNrPLYx4?si=gMbw7LKKSnpXi59U) — Samsung Developer Conference 2023
+- [NNTrainer: Personalize neural networks on devices!](https://www.youtube.com/watch?v=HKKowY78P1A) — Samsung Developer Conference 2021
+- [NNTrainer: "On-device learning"](https://www.youtube.com/embed/Jy_auavraKg?start=4035&end=4080) — Samsung AI Forum 2021
 
-### [Running Examples](https://github.com/nntrainer/nntrainer/blob/main/docs/how-to-run-examples.md)
-
-Instructions for preparing NNTrainer for execution
-
-### [Examples for NNTrainer](https://github.com/nntrainer/nntrainer/tree/main/Applications)
-
-NNTrainer examples for a variety of networks
-
-### [Components](https://github.com/nntrainer/nntrainer/blob/main/docs/components.md)
-
-[Our supported features](https://github.com/nntrainer/nntrainer/blob/main/docs/components.md#supported_feature)
-- Supported ptimizer
-- Supported Loss Functions
-- Supported Activation Functions
-- Supported Tensor
-- Others
-
-### APIs
-Currently, we provide [C APIs](https://github.com/nntrainer/nntrainer/blob/master/api/capi/include/nntrainer.h) for Tizen. [C++ APIs](https://github.com/nntrainer/nntrainer/blob/master/api/ccapi/include) are also provided for other platform. Java & C# APIs will be provided soon.
-
-## Open Source License
-
-The NNtrainer is an open source project released under the terms of the Apache License version 2.0.
+---
 
 ## Contributing
 
-Contributions are welcome! Please see our [Contributing](https://github.com/nntrainer/nntrainer/blob/main/docs/contributing.md) Guide for more details.
+Contributions are welcome! Please see our [Contributing Guide](https://github.com/nntrainer/nntrainer/blob/main/docs/contributing.md).
 
-[//]: # ([![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/0&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/0&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/1&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/1&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/2&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/2&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/3&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/3&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/4&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/4&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/5&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/5&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/6&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/6&#41;[![]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/images/7&#41;]&#40;https://sourcerer.io/fame/dongju-chae/nnstreamer/nntrainer/links/7&#41;)
+## License
+
+Apache License 2.0
 
 ## Citation
 
-If you find this NNTrainer project useful or relevant to your research, please consider citing our paper:
+If you find NNTrainer useful, please cite our paper:
 
-
-```
+```bibtex
 @inproceedings{10.1145/3639477.3639716,
-author = {Moon, Jijoong and Lee, Hyeonseok and Chu, Jiho and Park, Donghak and Hong, Seungbaek and Seo, Hyungjun and Jeong, Donghyeon and Kong, Sungsik and Ham, Myungjoo},
-title = {A New Frontier of AI: On-Device AI Training and Personalization},
-year = {2024},
-isbn = {9798400705014},
-publisher = {Association for Computing Machinery},
-url = {https://doi.org/10.1145/3639477.3639716},
-doi = {10.1145/3639477.3639716},
-booktitle = {Proceedings of the 46th International Conference on Software Engineering: Software Engineering in Practice},
-pages = {323–333},
-numpages = {11},
-keywords = {on-device AI, neural network, personalization, training, software framework},
-series = {ICSE-SEIP '24}
+  author = {Moon, Jijoong and Lee, Hyeonseok and Chu, Jiho and Park, Donghak and Hong, Seungbaek and Seo, Hyungjun and Jeong, Donghyeon and Kong, Sungsik and Ham, Myungjoo},
+  title = {A New Frontier of AI: On-Device AI Training and Personalization},
+  year = {2024},
+  isbn = {9798400705014},
+  publisher = {Association for Computing Machinery},
+  url = {https://doi.org/10.1145/3639477.3639716},
+  doi = {10.1145/3639477.3639716},
+  booktitle = {Proceedings of the 46th International Conference on Software Engineering: Software Engineering in Practice},
+  pages = {323--333},
+  numpages = {11},
+  keywords = {on-device AI, neural network, personalization, training, software framework},
+  series = {ICSE-SEIP '24}
 }
 ```

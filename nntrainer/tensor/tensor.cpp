@@ -11,6 +11,8 @@
 
 #include <numeric>
 
+#include <thread_manager.h>
+
 #include <char_tensor.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
@@ -18,6 +20,7 @@
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
+#include <qs4cx_tensor.h>
 #include <short_tensor.h>
 #include <tensor.h>
 #include <uint4_tensor.h>
@@ -131,6 +134,8 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
     itensor_ = std::make_unique<Q6_K_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(name_, fm);
+  } else if (d_type == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT8) {
@@ -179,6 +184,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
     itensor_ = std::make_unique<Q6_K_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, alloc_now, init, name);
+  } else if (d.getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8) {
       itensor_ =
@@ -231,6 +238,8 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
     itensor_ = std::make_unique<Q6_K_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, buf);
+  } else if (d.getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::UINT4) {
     if (qscheme != QScheme::Q4_Kx8)
       itensor_ = std::make_unique<Uint4QTensor>(d, buf, qscheme);
@@ -278,6 +287,8 @@ Tensor::Tensor(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -516,6 +527,7 @@ Tensor Tensor::multiply(float const &value) const {
 
 Tensor &Tensor::multiply(float const &value, Tensor &out) const {
   itensor_->multiply(value, out);
+  inheritContextTo(out);
   return out;
 }
 
@@ -547,7 +559,9 @@ Tensor &Tensor::multiply(Tensor const &m, Tensor &output,
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot multiply";
 
+  checkContextCompatibility(m, "multiply");
   itensor_->multiply(m, output, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -572,6 +586,7 @@ Tensor &Tensor::divide(float const &value, Tensor &output) const {
     throw std::invalid_argument(ss.str().c_str());
   }
   itensor_->divide(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -596,7 +611,9 @@ Tensor &Tensor::divide(Tensor const &m, Tensor &output) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot divide";
+  checkContextCompatibility(m, "divide");
   itensor_->divide(m, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -641,6 +658,7 @@ Tensor Tensor::add(float const &value) const {
 
 Tensor &Tensor::add(float const &value, Tensor &output) const {
   itensor_->add(value, output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -676,7 +694,9 @@ Tensor &Tensor::add(Tensor const &m, Tensor &output, float const alpha) const {
                   !output.getContiguous(),
                 std::invalid_argument)
     << getName() << " is not contiguous, cannot add";
+  checkContextCompatibility(m, "add");
   itensor_->add(m, output, alpha);
+  inheritContextTo(output);
   return output;
 }
 
@@ -716,6 +736,7 @@ Tensor Tensor::sum_by_batch() const {
 
   Tensor output(batch(), 1, 1, 1, this->getFormat(), getDataType());
   itensor_->sum_by_batch(output);
+  inheritContextTo(output);
   return output;
 }
 
@@ -776,7 +797,9 @@ Tensor &Tensor::abs(Tensor &output) const {
     throw std::invalid_argument(
       "Error: Tensor::abs requires output tensor to be same size, data type "
       "and format as input tensor.");
-  return itensor_->abs(output);
+  itensor_->abs(output);
+  inheritContextTo(output);
+  return output;
 }
 
 Tensor Tensor::average(unsigned int axis) const {
@@ -934,6 +957,7 @@ void Tensor::inv_sqrt_i() { itensor_->inv_sqrt(*this); }
 
 Tensor Tensor::inv_sqrt(Tensor &out) const {
   itensor_->inv_sqrt(out);
+  inheritContextTo(out);
   return out;
 }
 
@@ -1020,7 +1044,9 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous. Cannot dot product.";
 
+  checkContextCompatibility(input, "dot");
   itensor_->dot(input, output, trans, trans_in, beta);
+  inheritContextTo(output);
   return output;
 }
 
@@ -1327,9 +1353,9 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using OpenMP
-#pragma omp parallel for schedule(static)
-  for (int i = 0; i < static_cast<int>(indices.size()); ++i) {
+  // Parallel copy using ThreadManager
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];
 
     // Calculate memory offsets
@@ -1345,7 +1371,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
     // Perform memory copy
     std::memcpy(dst_data + dst_offset, src_data + src_offset,
                 single_batch_bytes);
-  }
+  });
 
   return output;
 }
@@ -1393,9 +1419,25 @@ void Tensor::read(std::ifstream &file, size_t start_offset,
   itensor_->read(file, start_offset, read_from_offset);
 }
 
-void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset) {
+void Tensor::read(ReadSource src, size_t start_offset, bool read_from_offset,
+                  int file_fd) {
   NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
     << getName() << " is not contiguous, cannot read.";
+
+  // save the start_offset_info
+  read_offset = start_offset;
+
+  // Virtual tensors are not backed by allocated memory; they are lazily
+  // mapped from the model file via activate(). Mirror the std::ifstream
+  // overload: do not actually read here, but remember the backing fd so
+  // a subsequent activate() can mmap(this->fd, ...) successfully. Without
+  // this, fd stays at -1 and activate() returns MAP_FAILED, leading to a
+  // segfault when the layer dereferences the mapped pointer.
+  if (is_virtual) {
+    if (file_fd != -1)
+      fd = file_fd;
+    return;
+  }
 
   itensor_->read(src, start_offset, read_from_offset);
 }
@@ -1471,6 +1513,7 @@ Tensor &Tensor::transpose(const std::string &direction, Tensor &output) const {
   }
 
   itensor_->transpose(direction, output);
+  inheritContextTo(output);
 
   return output;
 }
@@ -1620,17 +1663,31 @@ void Tensor::activate() {
 #else
 
   auto file_offset = getFileOffset();
-  size_t off = (file_offset / 4096) * 4096;
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  NNTR_THROW_IF(system_page_size <= 0, std::runtime_error)
+    << "[activate] failed to query the system page size";
+  const size_t page_size = static_cast<size_t>(system_page_size);
+  size_t off = (file_offset / page_size) * page_size;
   size_t diff = file_offset - off;
   size_t len = getMemoryBytes() + diff;
 
-  mapped_ptr = mmap(NULL, len, PROT_READ, MAP_PRIVATE, this->fd, off);
-#ifdef __ANDROID__
-  madvise(mapped_ptr, len, MADV_WILLNEED);
+  // A virtual tensor must have captured a backing fd during read (see
+  // Tensor::read overloads). Without it, mmap() below returns MAP_FAILED
+  // and dereferencing the resulting pointer segfaults the process.
+  NNTR_THROW_IF(this->fd == -1, std::runtime_error)
+    << "[activate] virtual tensor '" << getName()
+    << "' has no backing fd; the model file fd was not propagated at "
+       "read-time";
+
+  void *new_mapped_ptr = mmap(NULL, len, PROT_READ, MAP_PRIVATE, this->fd, off);
+#if defined(__ANDROID__) || defined(__linux__)
+  if (new_mapped_ptr != MAP_FAILED)
+    madvise(new_mapped_ptr, len, MADV_WILLNEED);
 #endif
-  if (mapped_ptr == MAP_FAILED) {
-    std::cerr << "[activate] mmap failed: " << strerror(errno) << std::endl;
-  }
+  NNTR_THROW_IF(new_mapped_ptr == MAP_FAILED, std::runtime_error)
+    << "[activate] mmap failed for virtual tensor '" << getName()
+    << "': " << strerror(errno);
+  mapped_ptr = new_mapped_ptr;
   itensor_->activate((void *)&((uint8_t *)mapped_ptr)[diff]);
 #endif
 }
@@ -1649,7 +1706,11 @@ void Tensor::deactivate() {
   };
 
   auto file_offset = getFileOffset();
-  size_t off = (file_offset / 4096) * 4096;
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  NNTR_THROW_IF(system_page_size <= 0, std::runtime_error)
+    << "[deactivate] failed to query the system page size";
+  const size_t page_size = static_cast<size_t>(system_page_size);
+  size_t off = (file_offset / page_size) * page_size;
   size_t diff = file_offset - off;
   size_t len = getMemoryBytes() + diff;
 

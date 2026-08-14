@@ -6,6 +6,7 @@
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
  * @file   causal_lm.h
+ * @brief  Base class for Transformer-based Causal Language Models (CausalLM).
  * @date   10 July 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
@@ -31,15 +32,22 @@
 #pragma once
 #ifdef _WIN32
 #define WIN_EXPORT __declspec(dllexport)
-#define WSTR std::wstring
-#define WCHAR_P wchar_t *
+#define WSTR std::string
+#define WCHAR_P std::string &
 #else
 #define WIN_EXPORT
 #define WSTR std::string
 #define WCHAR_P std::string &
 #endif
 
+#include <kv_cache_manager.h>
 #include <transformer.h>
+
+#include <atomic>
+
+extern "C" {
+struct BaseStreamer;
+}
 
 namespace causallm {
 
@@ -57,6 +65,16 @@ public:
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+
+#ifdef ENABLE_TEST
+protected:
+  /**
+   * @brief Construct a lightweight CausalLM test double base.
+   */
+  CausalLM() : Transformer() { output_list.push_back(""); }
+
+public:
+#endif
 
   /**
    * @brief Destroy the CausalLM object
@@ -81,9 +99,31 @@ public:
   std::string getOutput(int batch_idx = 0) const;
 
   /**
-   * @brief get the status of run
+   * @brief Attach or detach a non-owning streamer for decoded output deltas.
+   * @param streamer Streamer owned by the caller, or nullptr to detach
    */
-  bool hasRun() const { return has_run_; }
+  void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
+
+  /**
+   * @brief Cooperatively request the active generation loop to stop.
+   */
+  void requestStop() { stop_requested_.store(true, std::memory_order_release); }
+
+  /**
+   * @brief Clear stale stop requests before publishing a new cancellable run.
+   */
+  void prepareForRun();
+
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  void setLogitsProcessor(LogitsProcessor *processor) override;
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  void resetLogitsProcessor() override;
 
 protected:
   /**
@@ -93,9 +133,10 @@ protected:
                                json &nntr_cfg) override;
 
   /**
-   * @brief Construct Model
+   * @brief Construct Model — extends Transformer's symbolic graph with the
+   *        LM-head and returns the final {input, logits} pair.
    */
-  virtual void constructModel() override;
+  virtual std::pair<Tensor, Tensor> constructModel() override;
 
   /**
    * @brief register Outputs
@@ -128,12 +169,22 @@ protected:
    */
   void registerCustomLayers() override;
 
+  /**
+   * @brief Clear stale stop state at run start unless caller prepared it.
+   */
+  void prepareStopRequestForRun();
+
   /** internal buffer */
   std::vector<std::string>
-    output_list;             /**< List of output names for the model */
-  unsigned int *ids_history; /**< History of input IDs for the model */
+    output_list; /**< List of output names for the model */
+  unsigned int *ids_history =
+    nullptr; /**< History of input IDs for the model */
 
   std::vector<int> pending_ids_;
+
+  ::BaseStreamer *streamer_ = nullptr;
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_prepared_for_run_{false};
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;
@@ -147,14 +198,42 @@ protected:
 
   unsigned int SYS_PROMP_LEN;
   std::string PRE_COMPUTED_CACHE_PATH;
-  std::string TAIL_PROMPT;
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
+  bool SKIP_PREFILL;
   unsigned int global_token_len;
 
-  bool has_run_ = false;
-
   std::mt19937 rng; /**< Random Number Gen */
+
+  LogitsProcessor *logits_processor = nullptr; /**< Non-owning processor */
+
+  /**
+   * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()
+   *        once the model has been compiled (so we have the layer count,
+   *        head count, etc.) and bound to mha_core's input slots
+   *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
+   */
+  KVCacheManager kv_cache;
+  bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
+
+  /**
+   * @brief Allocate kv_cache and bind it to all mha_core layers via
+   *        Model::setExternalTensors. Idempotent — safe to call once after
+   *        initialize().
+   */
+  virtual void allocateAndBindKVCache();
+
+  /**
+   * @brief Reset all mha_core layers' cache_index to @p pos and the
+   *        KVCacheManager's tracked write position.
+   */
+  void setKVCachePosition(unsigned int pos);
+
+  /**
+   * @brief Advance all mha_core layers' cache_index by @p step_size and
+   *        update the KVCacheManager's tracked write position.
+   */
+  void advanceKVCachePosition(unsigned int step_size);
 };
 
 } // namespace causallm

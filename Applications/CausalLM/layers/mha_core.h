@@ -32,15 +32,18 @@
 #endif
 
 #include <complex>
+#include <memory>
+#include <unordered_map>
 
 #include <acti_func.h>
-#include <bs_thread_pool_manager.hpp>
 #include <common_properties.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
 #include <util_simd.h>
 
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace causallm {
@@ -106,6 +109,16 @@ public:
 };
 
 /**
+ * @brief UseRope property
+ */
+class UseRope : public nntrainer::Property<bool> {
+public:
+  UseRope(bool value = true) { set(value); };
+  static constexpr const char *key = "use_rope"; /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag;     /**< property type */
+};
+
+/**
  * @brief UseSink property
  */
 class UseSink : public nntrainer::Property<bool> {
@@ -156,6 +169,17 @@ public:
   RopeScalingFactor(float value = 1.0) { set(value); };
   static constexpr const char *key =
     "rope_scaling_factor";                    /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopePartialRotaryFactor
+ */
+class RopePartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  RopePartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "rope_partial_rotary_factor";             /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
 };
 
@@ -296,6 +320,18 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @brief Set the cache index for external cache mode.
+   *        Must be called before forwarding() when use_external_cache is true.
+   * @param[in] idx current write position in the KV cache
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+
+  /**
+   * @brief Get the current cache index
+   */
+  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+
   inline static const std::string type = "mha_core";
 
 private:
@@ -305,10 +341,11 @@ private:
     nntrainer::props::OutputShape, nntrainer::props::DropOutRate,
     nntrainer::props::ReturnAttentionWeight,
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
-    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
+    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta, props::UseRope,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::RopeScalingFactor, props::RopePartialRotaryFactor,
+    props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
+    props::IsCausal>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -316,6 +353,15 @@ private:
 
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
+
+  /**
+   * @brief Whether to use externally provided cache tensors
+   *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
+   *        In external mode mha_core does not allocate its own cache tensors,
+   *        and reads cache slots from input[3] (cache_key) and input[4]
+   *        (cache_value) which are bound by the host via setExternalTensors.
+   */
+  bool use_external_cache = false;
 
   /** intermal info */
   size_t num_heads_Q;
@@ -325,8 +371,10 @@ private:
   float theta;
   size_t local_window_size;
   bool use_sink = false;
+  bool use_rope = true;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool skip_prefill = false;
 
   enum INOUT_INDEX {
     /** input index */
@@ -363,17 +411,36 @@ private:
   float attention_scaling = 1.0f;
   float mscale = 1.0f;
   float scale = 1.0f;
+  float rope_partial_rotary_factor = 1.0f;
   unsigned int original_max_position_embeddings = 4096;
 
+  /** set by incremental_forwarding, used by forwarding */
+  unsigned int incremental_step_size = 0;
+
   /****************** ROTARY EMBEDDING *****************/
-  /** static variable - they are all expected to be initialized once */
-  inline static std::vector<std::vector<float>> *freqs_cos = {};
-  inline static std::vector<std::vector<float>> *freqs_sin = {};
-  inline static std::vector<float> thetas;
+  /**
+   * @brief FP32 rotary embedding cache entries.
+   */
+  struct RopeCacheFP32 {
+    std::vector<std::vector<float>> cos;
+    std::vector<std::vector<float>> sin;
+  };
+  inline static std::unordered_map<std::string, std::shared_ptr<RopeCacheFP32>>
+    rope_cache_fp32;
+  std::shared_ptr<RopeCacheFP32> freqs_fp32 = nullptr;
 #ifdef ENABLE_FP16
-  inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
-  inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};
+  /**
+   * @brief FP16 rotary embedding cache entries.
+   */
+  struct RopeCacheFP16 {
+    std::vector<std::vector<_FP16>> cos;
+    std::vector<std::vector<_FP16>> sin;
+  };
+  inline static std::unordered_map<std::string, std::shared_ptr<RopeCacheFP16>>
+    rope_cache_fp16;
+  std::shared_ptr<RopeCacheFP16> freqs_fp16 = nullptr;
 #endif
+  std::vector<float> thetas;
 
   /**
    * @brief pre_compute frequencies for Rotary Embedding.
@@ -394,6 +461,10 @@ private:
    * @brief _compute frequency parameters for default ROPE
    */
   void _compute_yarn_parameters(int head_dim, float theta);
+  void _compute_proportional_parameters(int head_dim, float theta);
+
+  std::string getRopeCacheKey(int head_dim, unsigned int seq_len,
+                              float theta) const;
 
   /**
    * @brief     apply rotary embedding
@@ -401,7 +472,7 @@ private:
    * @param[out] out output tensor
    * @param[in] dim hidden dim size
    * @param[in] from sequence order
-   * @param[in] convert_only - conversion only
+   * @param[in] convert_only true to only store the tensor into the cache dtype
    */
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
@@ -415,15 +486,13 @@ private:
   void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
-                       unsigned int group_size, unsigned int head_dim,
-                       BS::thread_pool<> &pool);
+                       unsigned int group_size, unsigned int head_dim);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, BS::thread_pool<> &pool);
+                        unsigned int from);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, BS::thread_pool<> &pool,
-                        nntrainer::Tensor &sink_step);
+                        unsigned int from, nntrainer::Tensor &sink_step);
 
   void compute_vcaches(nntrainer::Tensor &in, nntrainer::Tensor &vcache,
                        nntrainer::Tensor &out, unsigned int from,
@@ -434,8 +503,7 @@ private:
                                      nntrainer::Tensor &vcache,
                                      nntrainer::Tensor &output, int from,
                                      int num_cache_head, int gqa_size,
-                                     int head_dim, int to,
-                                     BS::thread_pool<> &pool);
+                                     int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
 
@@ -446,6 +514,20 @@ private:
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
 
   size_t calc_attn_index(size_t i);
+
+  /**
+   * @brief Windowed cumulative attention score index.
+   *
+   * Returns the cumulative number of attention scores before absolute query
+   * row i, respecting a sliding window of size local_window_size (W):
+   *
+   *   S(i) = sum_{k=0}^{i-1} min(k+1, W)
+   *        = (i <= W) ? i*(i+1)/2 : W*(W+1)/2 + (i - W)*W
+   *
+   * When W == UINT_MAX (full attention), this reduces exactly to
+   * i*(i+1)/2 == calc_attn_index(i), preserving byte-identical behaviour.
+   */
+  size_t calc_windowed_attn_index(size_t i);
 
 }; // end of class MHACoreLayer
 } // namespace causallm

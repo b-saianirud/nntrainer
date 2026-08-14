@@ -148,6 +148,132 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 #endif
 }
 
+#ifdef ENABLE_FP16
+// FP16-output variant of nntr_gemv_q4_0_4x8_q8_0. Same kernel body, but the
+// final store fuses an fcvtn (FP32 4-lane -> FP16 4-lane) and writes a 64-bit
+// d-register; the per-column-tile res_ptr advance halves to 8 bytes.
+void nntr_gemv_q4_0_4x8_q8_0_fp16(int n, __fp16 *__restrict s, size_t bs,
+                                  const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc) {
+  const int qk = Q8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 8;
+
+  assert(n % qk == 0);
+  assert(nc % ncols_interleaved == 0);
+#if defined(__ARM_FEATURE_DOTPROD)
+  const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx;
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int b = 0; b < nb; b++) {
+      int8x16_t b0 = vld1q_s8((const int8_t *)b_ptr->qs);
+      int8x16_t b1 = vld1q_s8((const int8_t *)b_ptr->qs + 16);
+      int8x16_t b2 = vld1q_s8((const int8_t *)b_ptr->qs + 32);
+      int8x16_t b3 = vld1q_s8((const int8_t *)b_ptr->qs + 48);
+      float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
+
+      int8x16_t a0 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs);
+      int8x16_t a1 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 1);
+      int8x16_t a2 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 2);
+      int8x16_t a3 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 3);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
+
+      int32x4_t ret0 = vdupq_n_s32(0);
+      int32x4_t ret1 = vdupq_n_s32(0);
+
+      ret0 = vdotq_s32(ret0, b0 << 4, a0);
+      ret1 = vdotq_s32(ret1, b1 << 4, a0);
+      ret0 = vdotq_s32(ret0, b2 << 4, a1);
+      ret1 = vdotq_s32(ret1, b3 << 4, a1);
+
+      ret0 = vdotq_s32(ret0, b0 & 0xf0U, a2);
+      ret1 = vdotq_s32(ret1, b1 & 0xf0U, a2);
+      ret0 = vdotq_s32(ret0, b2 & 0xf0U, a3);
+      ret1 = vdotq_s32(ret1, b3 & 0xf0U, a3);
+
+      int32x4_t ret = vpaddq_s32(ret0, ret1);
+
+      acc = vfmaq_f32(acc, vcvtq_n_f32_s32(ret, 4),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      a_ptr++;
+      b_ptr++;
+    }
+    vst1_f16((__fp16 *)s, vcvt_f16_f32(acc));
+    s += ncols_interleaved;
+  }
+  return;
+
+#else
+  const void *b_ptr = vx;
+  const void *a_ptr = vy;
+  __fp16 *res_ptr = s;
+
+  __asm__ __volatile__(
+    "movi v2.16b, #0x4\n"
+    "movi v1.16b, #0xf0\n"
+    "add %x[b_ptr], %x[b_ptr], #0x8\n"
+    "1:" // Column loop
+    "add x23, %x[a_ptr], #0x2\n"
+    "movi v0.16b, #0x0\n"
+    "mov x22, %x[nb]\n"
+    "2:" // Block loop
+    "ldr q31, [%x[b_ptr], #0x0]\n"
+    "ldr q30, [%x[b_ptr], #0x10]\n"
+    "mov x21, x23\n"
+    "movi v29.4s, #0x0\n"
+    "ldr q28, [%x[b_ptr], #0x20]\n"
+    "ldr q27, [%x[b_ptr], #0x30]\n"
+    "movi v26.4s, #0x0\n"
+    "sub x20, x23, #0x2\n"
+    "ld1r { v25.8h }, [x20]\n"
+    "ldr q24, [%x[b_ptr], #-0x8]\n"
+    "sub x22, x22, #0x1\n"
+    "add x23, x23, #0x22\n"
+    "ld1r { v23.2d }, [x21], #0x8\n"
+    "sshl v22.16b, v31.16b, v2.16b\n"
+    "sshl v16.16b, v30.16b, v2.16b\n"
+    "add %x[b_ptr], %x[b_ptr], #0x48\n"
+    "ld1r { v21.2d }, [x21], #0x8\n"
+    "sshl v20.16b, v28.16b, v2.16b\n"
+    "sshl v19.16b, v27.16b, v2.16b\n"
+    "ld1r { v18.2d }, [x21], #0x8\n"
+    "ld1r { v17.2d }, [x21], #0x8\n"
+    "and v31.16b, v31.16b, v1.16b\n"
+    "and v30.16b, v30.16b, v1.16b\n"
+    ".inst 0x4e9796dd  // sdot v29.4s, v22.16b, v23.16b\n"
+    ".inst 0x4e97961a  // sdot v26.4s, v16.16b, v23.16b\n"
+    "and v28.16b, v28.16b, v1.16b\n"
+    "and v27.16b, v27.16b, v1.16b\n"
+    "fcvtl v25.4s, v25.4h\n"
+    "fcvtl v16.4s, v24.4h\n"
+    ".inst 0x4e95969d  // sdot v29.4s, v20.16b, v21.16b\n"
+    ".inst 0x4e95967a  // sdot v26.4s, v19.16b, v21.16b\n"
+    "fmul v16.4s, v16.4s, v25.4s\n"
+    ".inst 0x4e9297fd  // sdot v29.4s, v31.16b, v18.16b\n"
+    ".inst 0x4e9297da  // sdot v26.4s, v30.16b, v18.16b\n"
+    ".inst 0x4e91979d  // sdot v29.4s, v28.16b, v17.16b\n"
+    ".inst 0x4e91977a  // sdot v26.4s, v27.16b, v17.16b\n"
+    "addp v29.4s, v29.4s, v26.4s\n"
+    "scvtf v29.4s, v29.4s, #0x4\n"
+    "fmla v0.4s, v29.4s, v16.4s\n"
+    "cbnz x22, 2b\n"
+    "sub %x[nc], %x[nc], #0x4\n"
+    "fcvtn v0.4h, v0.4s\n"
+    "str d0, [%x[res_ptr], #0x0]\n"
+    "add %x[res_ptr], %x[res_ptr], #0x8\n"
+    "cbnz %x[nc], 1b\n"
+    : [b_ptr] "+&r"(b_ptr), [res_ptr] "+&r"(res_ptr), [nc] "+&r"(nc)
+    : [a_ptr] "r"(a_ptr), [nb] "r"(nb)
+    : "memory", "v0", "v1", "v2", "v16", "v17", "v18", "v19", "v20", "v21",
+      "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+      "x20", "x21", "x22", "x23");
+  return;
+#endif
+}
+#endif // ENABLE_FP16
+
 void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
@@ -562,6 +688,447 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   return;
 }
 
+#ifdef ENABLE_FP16
+// FP16-output variant of nntr_gemm_q4_0_4x8_q8_0. Same kernel body, but every
+// store to the result buffer is fused with an fcvtn (FP32 4-lane -> FP16
+// 4-lane) and reduced to a 64-bit d-register write, and the per-column-tile
+// res_ptr advance halves to 8 bytes. Caller passes `bs` as the FP16 element
+// stride; res_stride is computed as bs * sizeof(_FP16) inside.
+void nntr_gemm_q4_0_4x8_q8_0_fp16(int n, _FP16 *__restrict s, size_t bs,
+                                  const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc) {
+  const int qk = Q8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 8;
+
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+  assert(nc % ncols_interleaved == 0);
+
+  const void *b_ptr = vx;
+  const void *a_ptr = vy;
+  _FP16 *res_ptr = s;
+  size_t res_stride = bs * sizeof(_FP16);
+
+  __asm__ __volatile__("mov x10, %x[nr]\n"
+                       "mov x9, #0x88\n"
+                       "cmp x10, #0x10\n"
+                       "mul x9, %x[nb], x9\n"
+                       "blt 4f\n"
+                       "1:" // Row loop
+                       "add x28, %x[b_ptr], #0x8\n"
+                       "mov x27, %x[nc]\n"
+                       "add x26, %x[res_ptr], %x[res_stride], LSL #4\n"
+                       "2:" // Column loop
+                       "add x25, %x[a_ptr], #0x8\n"
+                       "movi v2.16b, #0x0\n"
+                       "movi v10.16b, #0x0\n"
+                       "mov x24, %x[nb]\n"
+                       "add x23, x25, x9\n"
+                       "movi v12.16b, #0x0\n"
+                       "movi v28.16b, #0x0\n"
+                       "add x22, x23, x9\n"
+                       "movi v11.16b, #0x0\n"
+                       "movi v13.16b, #0x0\n"
+                       "add x21, x22, x9\n"
+                       "movi v22.16b, #0x0\n"
+                       "movi v23.16b, #0x0\n"
+                       "movi v25.16b, #0x0\n"
+                       "movi v5.16b, #0x0\n"
+                       "movi v7.16b, #0x0\n"
+                       "movi v4.16b, #0x0\n"
+                       "movi v6.16b, #0x0\n"
+                       "movi v30.16b, #0x0\n"
+                       "movi v24.16b, #0x0\n"
+                       "movi v14.16b, #0x0\n"
+                       "3:" // Block loop
+                       "ldr q21, [x28, #0x0]\n"
+                       "ldr q16, [x28, #0x10]\n"
+                       "movi v1.16b, #0x4\n"
+                       "movi v19.4s, #0x0\n"
+                       "ldr q27, [x25, #0x0]\n"
+                       "ldr q15, [x25, #0x10]\n"
+                       "movi v26.4s, #0x0\n"
+                       "movi v18.4s, #0x0\n"
+                       "ldr q29, [x28, #0x20]\n"
+                       "ldr q3, [x28, #0x30]\n"
+                       "movi v17.4s, #0x0\n"
+                       "movi v0.16b, #0xf0\n"
+                       "ldr d20, [x25, #-0x8]\n"
+                       "ldr d9, [x23, #-0x8]\n"
+                       "sshl v8.16b, v21.16b, v1.16b\n"
+                       "sshl v31.16b, v16.16b, v1.16b\n"
+                       "and v21.16b, v21.16b, v0.16b\n"
+                       "and v16.16b, v16.16b, v0.16b\n"
+                       "sub x20, x28, #0x8\n"
+                       "subs x24, x24, #0x1\n"
+                       "add x28, x28, #0x48\n"
+                       ".inst 0x4e88a773  // smmla v19.4s, v27.16b, v8.16b\n"
+                       ".inst 0x4e9fa77a  // smmla v26.4s, v27.16b, v31.16b\n"
+                       "ldr q27, [x25, #0x20]\n"
+                       ".inst 0x4e88a5f2  // smmla v18.4s, v15.16b, v8.16b\n"
+                       ".inst 0x4e9fa5f1  // smmla v17.4s, v15.16b, v31.16b\n"
+                       "sshl v15.16b, v29.16b, v1.16b\n"
+                       "sshl v1.16b, v3.16b, v1.16b\n"
+                       "and v29.16b, v29.16b, v0.16b\n"
+                       "and v3.16b, v3.16b, v0.16b\n"
+                       "ldr q0, [x25, #0x30]\n"
+                       "fcvtl v20.4s, v20.4h\n"
+                       ".inst 0x4e8fa773  // smmla v19.4s, v27.16b, v15.16b\n"
+                       "fcvtl v9.4s, v9.4h\n"
+                       ".inst 0x4e81a77a  // smmla v26.4s, v27.16b, v1.16b\n"
+                       "ldr q27, [x25, #0x40]\n"
+                       ".inst 0x4e8fa412  // smmla v18.4s, v0.16b, v15.16b\n"
+                       ".inst 0x4e81a411  // smmla v17.4s, v0.16b, v1.16b\n"
+                       "ldr q0, [x25, #0x50]\n"
+                       ".inst 0x4e95a773  // smmla v19.4s, v27.16b, v21.16b\n"
+                       ".inst 0x4e90a77a  // smmla v26.4s, v27.16b, v16.16b\n"
+                       "ldr q27, [x25, #0x60]\n"
+                       ".inst 0x4e95a412  // smmla v18.4s, v0.16b, v21.16b\n"
+                       ".inst 0x4e90a411  // smmla v17.4s, v0.16b, v16.16b\n"
+                       "ldr q0, [x25, #0x70]\n"
+                       "add x25, x25, #0x88\n"
+                       ".inst 0x4e9da773  // smmla v19.4s, v27.16b, v29.16b\n"
+                       ".inst 0x4e83a77a  // smmla v26.4s, v27.16b, v3.16b\n"
+                       "ldr d27, [x20, #0x0]\n"
+                       ".inst 0x4e9da412  // smmla v18.4s, v0.16b, v29.16b\n"
+                       ".inst 0x4e83a411  // smmla v17.4s, v0.16b, v3.16b\n"
+                       "fcvtl v27.4s, v27.4h\n"
+                       "uzp1 v0.2d, v19.2d, v26.2d\n"
+                       "uzp2 v26.2d, v19.2d, v26.2d\n"
+                       "fmul v19.4s, v27.4s, v20.s[0]\n"
+                       "scvtf v0.4s, v0.4s, #0x4\n"
+                       "scvtf v26.4s, v26.4s, #0x4\n"
+                       "fmla v2.4s, v0.4s, v19.4s\n"
+                       "ldr q19, [x23, #0x0]\n"
+                       "uzp1 v0.2d, v18.2d, v17.2d\n"
+                       "uzp2 v18.2d, v18.2d, v17.2d\n"
+                       "fmul v17.4s, v27.4s, v20.s[1]\n"
+                       "scvtf v0.4s, v0.4s, #0x4\n"
+                       "scvtf v18.4s, v18.4s, #0x4\n"
+                       "fmla v10.4s, v26.4s, v17.4s\n"
+                       "ldr q17, [x23, #0x10]\n"
+                       "fmul v26.4s, v27.4s, v20.s[2]\n"
+                       "fmul v20.4s, v27.4s, v20.s[3]\n"
+                       "fmla v12.4s, v0.4s, v26.4s\n"
+                       "ldr d0, [x22, #-0x8]\n"
+                       "ldr d26, [x21, #-0x8]\n"
+                       "fcvtl v0.4s, v0.4h\n"
+                       "fmla v28.4s, v18.4s, v20.4s\n"
+                       "movi v20.4s, #0x0\n"
+                       "movi v18.4s, #0x0\n"
+                       ".inst 0x4e88a674  // smmla v20.4s, v19.16b, v8.16b\n"
+                       ".inst 0x4e9fa672  // smmla v18.4s, v19.16b, v31.16b\n"
+                       "ldr q19, [x23, #0x20]\n"
+                       "fcvtl v26.4s, v26.4h\n"
+                       ".inst 0x4e8fa674  // smmla v20.4s, v19.16b, v15.16b\n"
+                       ".inst 0x4e81a672  // smmla v18.4s, v19.16b, v1.16b\n"
+                       "ldr q19, [x23, #0x40]\n"
+                       ".inst 0x4e95a674  // smmla v20.4s, v19.16b, v21.16b\n"
+                       ".inst 0x4e90a672  // smmla v18.4s, v19.16b, v16.16b\n"
+                       "ldr q19, [x23, #0x60]\n"
+                       ".inst 0x4e9da674  // smmla v20.4s, v19.16b, v29.16b\n"
+                       ".inst 0x4e83a672  // smmla v18.4s, v19.16b, v3.16b\n"
+                       "uzp1 v19.2d, v20.2d, v18.2d\n"
+                       "scvtf v19.4s, v19.4s, #0x4\n"
+                       "uzp2 v20.2d, v20.2d, v18.2d\n"
+                       "fmul v18.4s, v27.4s, v9.s[0]\n"
+                       "scvtf v20.4s, v20.4s, #0x4\n"
+                       "fmla v11.4s, v19.4s, v18.4s\n"
+                       "ldr q18, [x22, #0x0]\n"
+                       "fmul v19.4s, v27.4s, v9.s[1]\n"
+                       "fmla v13.4s, v20.4s, v19.4s\n"
+                       "movi v19.4s, #0x0\n"
+                       "movi v20.4s, #0x0\n"
+                       ".inst 0x4e88a633  // smmla v19.4s, v17.16b, v8.16b\n"
+                       ".inst 0x4e9fa634  // smmla v20.4s, v17.16b, v31.16b\n"
+                       "ldr q17, [x23, #0x30]\n"
+                       ".inst 0x4e8fa633  // smmla v19.4s, v17.16b, v15.16b\n"
+                       ".inst 0x4e81a634  // smmla v20.4s, v17.16b, v1.16b\n"
+                       "ldr q17, [x23, #0x50]\n"
+                       ".inst 0x4e95a633  // smmla v19.4s, v17.16b, v21.16b\n"
+                       ".inst 0x4e90a634  // smmla v20.4s, v17.16b, v16.16b\n"
+                       "ldr q17, [x23, #0x70]\n"
+                       "add x23, x23, #0x88\n"
+                       ".inst 0x4e9da633  // smmla v19.4s, v17.16b, v29.16b\n"
+                       ".inst 0x4e83a634  // smmla v20.4s, v17.16b, v3.16b\n"
+                       "uzp1 v17.2d, v19.2d, v20.2d\n"
+                       "scvtf v17.4s, v17.4s, #0x4\n"
+                       "uzp2 v20.2d, v19.2d, v20.2d\n"
+                       "fmul v19.4s, v27.4s, v9.s[2]\n"
+                       "fmul v9.4s, v27.4s, v9.s[3]\n"
+                       "scvtf v20.4s, v20.4s, #0x4\n"
+                       "fmla v22.4s, v17.4s, v19.4s\n"
+                       "ldr q17, [x22, #0x10]\n"
+                       "movi v19.4s, #0x0\n"
+                       ".inst 0x4e88a653  // smmla v19.4s, v18.16b, v8.16b\n"
+                       "fmla v23.4s, v20.4s, v9.4s\n"
+                       "movi v20.4s, #0x0\n"
+                       "movi v9.4s, #0x0\n"
+                       ".inst 0x4e9fa654  // smmla v20.4s, v18.16b, v31.16b\n"
+                       "ldr q18, [x22, #0x20]\n"
+                       ".inst 0x4e88a629  // smmla v9.4s, v17.16b, v8.16b\n"
+                       ".inst 0x4e8fa653  // smmla v19.4s, v18.16b, v15.16b\n"
+                       ".inst 0x4e81a654  // smmla v20.4s, v18.16b, v1.16b\n"
+                       "ldr q18, [x22, #0x40]\n"
+                       ".inst 0x4e95a653  // smmla v19.4s, v18.16b, v21.16b\n"
+                       ".inst 0x4e90a654  // smmla v20.4s, v18.16b, v16.16b\n"
+                       "ldr q18, [x22, #0x60]\n"
+                       ".inst 0x4e9da653  // smmla v19.4s, v18.16b, v29.16b\n"
+                       ".inst 0x4e83a654  // smmla v20.4s, v18.16b, v3.16b\n"
+                       "movi v18.4s, #0x0\n"
+                       ".inst 0x4e9fa632  // smmla v18.4s, v17.16b, v31.16b\n"
+                       "ldr q17, [x22, #0x30]\n"
+                       ".inst 0x4e8fa629  // smmla v9.4s, v17.16b, v15.16b\n"
+                       ".inst 0x4e81a632  // smmla v18.4s, v17.16b, v1.16b\n"
+                       "ldr q17, [x22, #0x50]\n"
+                       ".inst 0x4e95a629  // smmla v9.4s, v17.16b, v21.16b\n"
+                       ".inst 0x4e90a632  // smmla v18.4s, v17.16b, v16.16b\n"
+                       "ldr q17, [x22, #0x70]\n"
+                       "add x22, x22, #0x88\n"
+                       ".inst 0x4e9da629  // smmla v9.4s, v17.16b, v29.16b\n"
+                       ".inst 0x4e83a632  // smmla v18.4s, v17.16b, v3.16b\n"
+                       "uzp1 v17.2d, v19.2d, v20.2d\n"
+                       "uzp2 v20.2d, v19.2d, v20.2d\n"
+                       "fmul v19.4s, v27.4s, v0.s[0]\n"
+                       "scvtf v17.4s, v17.4s, #0x4\n"
+                       "scvtf v20.4s, v20.4s, #0x4\n"
+                       "fmla v25.4s, v17.4s, v19.4s\n"
+                       "ldr q19, [x21, #0x0]\n"
+                       "fmul v17.4s, v27.4s, v0.s[1]\n"
+                       "fmla v5.4s, v20.4s, v17.4s\n"
+                       "ldr q17, [x21, #0x10]\n"
+                       "uzp1 v20.2d, v9.2d, v18.2d\n"
+                       "uzp2 v9.2d, v9.2d, v18.2d\n"
+                       "fmul v18.4s, v27.4s, v0.s[2]\n"
+                       "fmul v0.4s, v27.4s, v0.s[3]\n"
+                       "scvtf v20.4s, v20.4s, #0x4\n"
+                       "scvtf v9.4s, v9.4s, #0x4\n"
+                       "fmla v7.4s, v20.4s, v18.4s\n"
+                       "movi v20.4s, #0x0\n"
+                       "movi v18.4s, #0x0\n"
+                       ".inst 0x4e88a674  // smmla v20.4s, v19.16b, v8.16b\n"
+                       ".inst 0x4e9fa672  // smmla v18.4s, v19.16b, v31.16b\n"
+                       "ldr q19, [x21, #0x20]\n"
+                       "fmla v4.4s, v9.4s, v0.4s\n"
+                       "movi v9.4s, #0x0\n"
+                       "movi v0.4s, #0x0\n"
+                       ".inst 0x4e88a629  // smmla v9.4s, v17.16b, v8.16b\n"
+                       "fmul v8.4s, v27.4s, v26.s[0]\n"
+                       ".inst 0x4e9fa620  // smmla v0.4s, v17.16b, v31.16b\n"
+                       "ldr q17, [x21, #0x30]\n"
+                       ".inst 0x4e8fa674  // smmla v20.4s, v19.16b, v15.16b\n"
+                       "fmul v31.4s, v27.4s, v26.s[1]\n"
+                       ".inst 0x4e81a672  // smmla v18.4s, v19.16b, v1.16b\n"
+                       "ldr q19, [x21, #0x40]\n"
+                       ".inst 0x4e8fa629  // smmla v9.4s, v17.16b, v15.16b\n"
+                       "fmul v15.4s, v27.4s, v26.s[2]\n"
+                       "fmul v27.4s, v27.4s, v26.s[3]\n"
+                       ".inst 0x4e81a620  // smmla v0.4s, v17.16b, v1.16b\n"
+                       "ldr q1, [x21, #0x50]\n"
+                       ".inst 0x4e95a674  // smmla v20.4s, v19.16b, v21.16b\n"
+                       ".inst 0x4e90a672  // smmla v18.4s, v19.16b, v16.16b\n"
+                       "ldr q26, [x21, #0x60]\n"
+                       ".inst 0x4e95a429  // smmla v9.4s, v1.16b, v21.16b\n"
+                       ".inst 0x4e90a420  // smmla v0.4s, v1.16b, v16.16b\n"
+                       "ldr q21, [x21, #0x70]\n"
+                       "add x21, x21, #0x88\n"
+                       ".inst 0x4e9da754  // smmla v20.4s, v26.16b, v29.16b\n"
+                       ".inst 0x4e83a752  // smmla v18.4s, v26.16b, v3.16b\n"
+                       ".inst 0x4e9da6a9  // smmla v9.4s, v21.16b, v29.16b\n"
+                       ".inst 0x4e83a6a0  // smmla v0.4s, v21.16b, v3.16b\n"
+                       "uzp1 v29.2d, v20.2d, v18.2d\n"
+                       "uzp2 v21.2d, v20.2d, v18.2d\n"
+                       "scvtf v29.4s, v29.4s, #0x4\n"
+                       "uzp1 v18.2d, v9.2d, v0.2d\n"
+                       "uzp2 v16.2d, v9.2d, v0.2d\n"
+                       "scvtf v21.4s, v21.4s, #0x4\n"
+                       "fmla v6.4s, v29.4s, v8.4s\n"
+                       "scvtf v18.4s, v18.4s, #0x4\n"
+                       "scvtf v16.4s, v16.4s, #0x4\n"
+                       "fmla v30.4s, v21.4s, v31.4s\n"
+                       "fmla v24.4s, v18.4s, v15.4s\n"
+                       "fmla v14.4s, v16.4s, v27.4s\n"
+                       "bgt 3b\n"
+                       "mov x20, %x[res_ptr]\n"
+                       "subs x27, x27, #0x4\n"
+                       "add %x[res_ptr], %x[res_ptr], #0x8\n"
+                       "fcvtn v2.4h, v2.4s\n"
+                       "str d2, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v10.4h, v10.4s\n"
+                       "str d10, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v12.4h, v12.4s\n"
+                       "str d12, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v28.4h, v28.4s\n"
+                       "str d28, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v11.4h, v11.4s\n"
+                       "str d11, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v13.4h, v13.4s\n"
+                       "str d13, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v22.4h, v22.4s\n"
+                       "str d22, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v23.4h, v23.4s\n"
+                       "str d23, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v25.4h, v25.4s\n"
+                       "str d25, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v5.4h, v5.4s\n"
+                       "str d5, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v7.4h, v7.4s\n"
+                       "str d7, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v4.4h, v4.4s\n"
+                       "str d4, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v6.4h, v6.4s\n"
+                       "str d6, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v30.4h, v30.4s\n"
+                       "str d30, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v24.4h, v24.4s\n"
+                       "str d24, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "fcvtn v14.4h, v14.4s\n"
+                       "str d14, [x20, #0x0]\n"
+                       "bne 2b\n"
+                       "mov x20, #0x4\n"
+                       "sub x10, x10, #0x10\n"
+                       "cmp x10, #0x10\n"
+                       "mov %x[res_ptr], x26\n"
+                       "madd %x[a_ptr], x20, x9, %x[a_ptr]\n"
+                       "bge 1b\n"
+                       "4:" // Row loop skip
+                       "cbz x10, 9f\n"
+                       "5:" // Row tail: Row loop
+                       "add x24, %x[b_ptr], #0x8\n"
+                       "mov x23, %x[nc]\n"
+                       "add x22, %x[res_ptr], %x[res_stride], LSL #2\n"
+                       "6:" // Row tail: Column loop
+                       "movi v2.16b, #0x0\n"
+                       "movi v10.16b, #0x0\n"
+                       "add x25, %x[a_ptr], #0x8\n"
+                       "mov x21, %x[nb]\n"
+                       "movi v12.16b, #0x0\n"
+                       "movi v28.16b, #0x0\n"
+                       "7:" // Row tail: Block loop
+                       "ldr q6, [x24, #0x0]\n"
+                       "ldr q5, [x24, #0x10]\n"
+                       "movi v17.16b, #0x4\n"
+                       "movi v8.4s, #0x0\n"
+                       "ldr q4, [x25, #0x0]\n"
+                       "ldr q13, [x25, #0x10]\n"
+                       "movi v27.4s, #0x0\n"
+                       "movi v0.4s, #0x0\n"
+                       "ldr q31, [x24, #0x20]\n"
+                       "ldr q14, [x24, #0x30]\n"
+                       "movi v29.4s, #0x0\n"
+                       "movi v22.16b, #0xf0\n"
+                       "ldr q11, [x25, #0x20]\n"
+                       "ldr q23, [x25, #0x30]\n"
+                       "sshl v21.16b, v6.16b, v17.16b\n"
+                       "sshl v16.16b, v5.16b, v17.16b\n"
+                       "ldr q20, [x25, #0x40]\n"
+                       "ldr q26, [x25, #0x50]\n"
+                       "and v6.16b, v6.16b, v22.16b\n"
+                       "and v5.16b, v5.16b, v22.16b\n"
+                       "ldr q25, [x25, #0x60]\n"
+                       "ldr q3, [x25, #0x70]\n"
+                       "sshl v19.16b, v31.16b, v17.16b\n"
+                       "sshl v18.16b, v14.16b, v17.16b\n"
+                       "ldr d17, [x25, #-0x8]\n"
+                       ".inst 0x4e95a488  // smmla v8.4s, v4.16b, v21.16b\n"
+                       ".inst 0x4e90a49b  // smmla v27.4s, v4.16b, v16.16b\n"
+                       "and v31.16b, v31.16b, v22.16b\n"
+                       ".inst 0x4e95a5a0  // smmla v0.4s, v13.16b, v21.16b\n"
+                       ".inst 0x4e90a5bd  // smmla v29.4s, v13.16b, v16.16b\n"
+                       "and v14.16b, v14.16b, v22.16b\n"
+                       "sub x20, x24, #0x8\n"
+                       "ldr d16, [x20, #0x0]\n"
+                       "subs x21, x21, #0x1\n"
+                       "add x25, x25, #0x88\n"
+                       "fcvtl v17.4s, v17.4h\n"
+                       "add x24, x24, #0x48\n"
+                       ".inst 0x4e93a568  // smmla v8.4s, v11.16b, v19.16b\n"
+                       ".inst 0x4e92a57b  // smmla v27.4s, v11.16b, v18.16b\n"
+                       ".inst 0x4e93a6e0  // smmla v0.4s, v23.16b, v19.16b\n"
+                       ".inst 0x4e92a6fd  // smmla v29.4s, v23.16b, v18.16b\n"
+                       "fcvtl v16.4s, v16.4h\n"
+                       ".inst 0x4e86a688  // smmla v8.4s, v20.16b, v6.16b\n"
+                       ".inst 0x4e85a69b  // smmla v27.4s, v20.16b, v5.16b\n"
+                       "fmul v23.4s, v16.4s, v17.s[0]\n"
+                       "fmul v21.4s, v16.4s, v17.s[1]\n"
+                       "fmul v1.4s, v16.4s, v17.s[2]\n"
+                       "fmul v20.4s, v16.4s, v17.s[3]\n"
+                       ".inst 0x4e86a740  // smmla v0.4s, v26.16b, v6.16b\n"
+                       ".inst 0x4e85a75d  // smmla v29.4s, v26.16b, v5.16b\n"
+                       ".inst 0x4e9fa728  // smmla v8.4s, v25.16b, v31.16b\n"
+                       ".inst 0x4e8ea73b  // smmla v27.4s, v25.16b, v14.16b\n"
+                       ".inst 0x4e9fa460  // smmla v0.4s, v3.16b, v31.16b\n"
+                       ".inst 0x4e8ea47d  // smmla v29.4s, v3.16b, v14.16b\n"
+                       "uzp1 v19.2d, v8.2d, v27.2d\n"
+                       "uzp2 v18.2d, v8.2d, v27.2d\n"
+                       "scvtf v19.4s, v19.4s, #0x4\n"
+                       "uzp1 v17.2d, v0.2d, v29.2d\n"
+                       "uzp2 v16.2d, v0.2d, v29.2d\n"
+                       "scvtf v18.4s, v18.4s, #0x4\n"
+                       "fmla v2.4s, v19.4s, v23.4s\n"
+                       "scvtf v17.4s, v17.4s, #0x4\n"
+                       "scvtf v16.4s, v16.4s, #0x4\n"
+                       "fmla v10.4s, v18.4s, v21.4s\n"
+                       "fmla v12.4s, v17.4s, v1.4s\n"
+                       "fmla v28.4s, v16.4s, v20.4s\n"
+                       "bgt 7b\n"
+                       "mov x20, %x[res_ptr]\n"
+                       "cmp x10, #0x1\n"
+                       "fcvtn v2.4h, v2.4s\n"
+                       "str d2, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "ble 8f\n"
+                       "cmp x10, #0x2\n"
+                       "fcvtn v10.4h, v10.4s\n"
+                       "str d10, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "ble 8f\n"
+                       "cmp x10, #0x3\n"
+                       "fcvtn v12.4h, v12.4s\n"
+                       "str d12, [x20, #0x0]\n"
+                       "add x20, x20, %x[res_stride]\n"
+                       "ble 8f\n"
+                       "fcvtn v28.4h, v28.4s\n"
+                       "str d28, [x20, #0x0]\n"
+                       "8:" // Row tail: Accumulator store skip
+                       "subs x23, x23, #0x4\n"
+                       "add %x[res_ptr], %x[res_ptr], #0x8\n"
+                       "bne 6b\n"
+                       "subs x10, x10, #0x4\n"
+                       "add %x[a_ptr], %x[a_ptr], x9\n"
+                       "mov %x[res_ptr], x22\n"
+                       "bgt 5b\n"
+                       "9:" // Row tail: Row loop skip
+                       : [a_ptr] "+&r"(a_ptr), [res_ptr] "+&r"(res_ptr)
+                       : [b_ptr] "r"(b_ptr), [nr] "r"(nr), [nb] "r"(nb),
+                         [res_stride] "r"(res_stride), [nc] "r"(nc)
+                       : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5",
+                         "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+                         "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21",
+                         "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",
+                         "v30", "v31", "x9", "x10", "x20", "x21", "x22", "x23",
+                         "x24", "x25", "x26", "x27", "x28");
+  return;
+}
+#endif // ENABLE_FP16
+
 void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
@@ -617,6 +1184,394 @@ void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
       }
     }
   }
+}
+
+void nntr_gemm_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  [[maybe_unused]] const int nb = n / qk;
+  [[maybe_unused]] const int ncols_interleaved = 4;
+  [[maybe_unused]] const int blocklen = 4;
+
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+  assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+      float32x4_t sumf[4];
+      for (int m = 0; m < 4; m++) {
+        sumf[m] = vdupq_n_f32(0);
+      }
+
+      for (int l = 0; l < nb; l++) {
+        float32x4_t a_d = vcvt_f32_f16(vld1_f16((const float16_t *)a_ptr[l].d));
+        float32x4_t b_d = vcvt_f32_f16(vld1_f16((const float16_t *)b_ptr[l].d));
+
+        int32x4_t sumi_0 = vdupq_n_s32(0);
+        int32x4_t sumi_1 = vdupq_n_s32(0);
+        int32x4_t sumi_2 = vdupq_n_s32(0);
+        int32x4_t sumi_3 = vdupq_n_s32(0);
+
+        for (int k_group = 0; k_group < 8; k_group += 4) {
+          int8x16x4_t a = vld1q_s8_x4(a_ptr[l].qs + 16 * k_group);
+          int8x16x4_t b = vld1q_s8_x4(b_ptr[l].qs + 16 * k_group);
+
+          for (int k = 0; k < 4; k++) {
+            sumi_0 = vdotq_laneq_s32(sumi_0, b.val[k], a.val[k], 0);
+            sumi_1 = vdotq_laneq_s32(sumi_1, b.val[k], a.val[k], 1);
+            sumi_2 = vdotq_laneq_s32(sumi_2, b.val[k], a.val[k], 2);
+            sumi_3 = vdotq_laneq_s32(sumi_3, b.val[k], a.val[k], 3);
+          }
+        }
+
+        sumf[0] = vmlaq_f32(sumf[0], vmulq_laneq_f32(b_d, a_d, 0),
+                            vcvtq_f32_s32(sumi_0));
+        sumf[1] = vmlaq_f32(sumf[1], vmulq_laneq_f32(b_d, a_d, 1),
+                            vcvtq_f32_s32(sumi_1));
+        sumf[2] = vmlaq_f32(sumf[2], vmulq_laneq_f32(b_d, a_d, 2),
+                            vcvtq_f32_s32(sumi_2));
+        sumf[3] = vmlaq_f32(sumf[3], vmulq_laneq_f32(b_d, a_d, 3),
+                            vcvtq_f32_s32(sumi_3));
+      }
+
+      for (int m = 0; m < 4; m++) {
+        vst1q_f32(s + (y * 4 + m) * bs + x * 4, sumf[m]);
+      }
+    }
+  }
+#else
+  float sumf[4][4];
+  int sumi;
+
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumf[m][j] = 0.0;
+        }
+      }
+      for (int l = 0; l < nb; l++) {
+        for (int k = 0; k < (qk / blocklen); k++) {
+          for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+              sumi = 0;
+              for (int i = 0; i < blocklen; ++i) {
+                const int v0 =
+                  b_ptr[l]
+                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
+              }
+              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+        }
+      }
+    }
+  }
+#endif
+}
+
+void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+
+  const int qk = QK8_0;
+  [[maybe_unused]] const int nb = n / qk;
+  [[maybe_unused]] const int ncols_interleaved = 4;
+  [[maybe_unused]] const int blocklen = 4;
+
+  assert(n % qk == 0);
+  assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx;
+
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int b = 0; b < nb; b++) {
+      int8x16x4_t b_low = vld1q_s8_x4((const int8_t *)b_ptr->qs);
+      int8x16x4_t b_high = vld1q_s8_x4((const int8_t *)b_ptr->qs + 64);
+      float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
+
+      int8x16x2_t a = vld1q_s8_x2(a_ptr->qs);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
+
+      int32x4_t ret = vdupq_n_s32(0);
+
+      ret = vdotq_laneq_s32(ret, b_low.val[0], a.val[0], 0);
+      ret = vdotq_laneq_s32(ret, b_low.val[1], a.val[0], 1);
+      ret = vdotq_laneq_s32(ret, b_low.val[2], a.val[0], 2);
+      ret = vdotq_laneq_s32(ret, b_low.val[3], a.val[0], 3);
+
+      ret = vdotq_laneq_s32(ret, b_high.val[0], a.val[1], 0);
+      ret = vdotq_laneq_s32(ret, b_high.val[1], a.val[1], 1);
+      ret = vdotq_laneq_s32(ret, b_high.val[2], a.val[1], 2);
+      ret = vdotq_laneq_s32(ret, b_high.val[3], a.val[1], 3);
+
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(ret),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      a_ptr++;
+      b_ptr++;
+    }
+    vst1q_f32(s, acc);
+    s += ncols_interleaved;
+  }
+#else
+  float sumf[4];
+  int sumi;
+
+  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+  for (int x = 0; x < nc / ncols_interleaved; x++) {
+    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+    for (int j = 0; j < ncols_interleaved; j++) {
+      sumf[j] = 0.0;
+    }
+    for (int l = 0; l < nb; l++) {
+      for (int k = 0; k < (qk / blocklen); k++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumi = 0;
+          for (int i = 0; i < blocklen; ++i) {
+            const int v0 =
+              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+            sumi += v0 * a_ptr[l].qs[k * blocklen + i];
+          }
+          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
+        }
+      }
+    }
+    for (int j = 0; j < ncols_interleaved; j++) {
+      s[x * ncols_interleaved + j] = sumf[j];
+    }
+  }
+#endif
+}
+
+void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+
+  const block_q8_0x4 *b_ptr_base = (const block_q8_0x4 *)vx;
+  const int qk = QK8_0;
+  [[maybe_unused]] const int nb = n / qk;
+  [[maybe_unused]] const int ncols_interleaved = 4;
+  [[maybe_unused]] const int blocklen = 8;
+
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+  assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  for (int y = 0; y < nr; y += 4) {
+    const block_q8_0x4 *a_ptr_base = (const block_q8_0x4 *)vy + (y / 4) * nb;
+
+    for (int x = 0; x < nc; x += ncols_interleaved) {
+      const block_q8_0x4 *b_ptr = b_ptr_base + (x / 4) * nb;
+      const block_q8_0x4 *a_ptr = a_ptr_base;
+
+      float32x4_t acc_f32[4];
+      for (int i = 0; i < 4; i++) {
+        acc_f32[i] = vdupq_n_f32(0);
+      }
+
+      for (int b = 0; b < nb; b++) {
+        int32x4_t acc[4];
+        for (int i = 0; i < 4; i++) {
+          acc[i] = vdupq_n_s32(0);
+        }
+
+        // Process 4 chunks of 8 positions each
+        for (int chunk = 0; chunk < 4; chunk++) {
+          int8x16_t a01 = vld1q_s8(a_ptr->qs + chunk * 32);
+          int8x16_t a23 = vld1q_s8(a_ptr->qs + chunk * 32 + 16);
+          int8x16_t b01 = vld1q_s8(b_ptr->qs + chunk * 32);
+          int8x16_t b23 = vld1q_s8(b_ptr->qs + chunk * 32 + 16);
+
+          acc[0] = vmmlaq_s32(acc[0], a01, b01);
+          acc[1] = vmmlaq_s32(acc[1], a01, b23);
+          acc[2] = vmmlaq_s32(acc[2], a23, b01);
+          acc[3] = vmmlaq_s32(acc[3], a23, b23);
+        }
+
+        // Reorder outputs from 2×2 tiles to row-major
+        // acc[0] = [r0c0, r0c1, r1c0, r1c1]
+        // acc[1] = [r0c2, r0c3, r1c2, r1c3]
+        // acc[2] = [r2c0, r2c1, r3c0, r3c1]
+        // acc[3] = [r2c2, r2c3, r3c2, r3c3]
+        int32x4_t row0 =
+          vcombine_s32(vget_low_s32(acc[0]), vget_low_s32(acc[1]));
+        int32x4_t row1 =
+          vcombine_s32(vget_high_s32(acc[0]), vget_high_s32(acc[1]));
+        int32x4_t row2 =
+          vcombine_s32(vget_low_s32(acc[2]), vget_low_s32(acc[3]));
+        int32x4_t row3 =
+          vcombine_s32(vget_high_s32(acc[2]), vget_high_s32(acc[3]));
+
+        // Scales
+        float32x4_t a_d = vcvt_f32_f16(vld1_f16((const __fp16 *)a_ptr->d));
+        float32x4_t b_d = vcvt_f32_f16(vld1_f16((const __fp16 *)b_ptr->d));
+
+        acc_f32[0] = vfmaq_f32(acc_f32[0], vcvtq_f32_s32(row0),
+                               vmulq_laneq_f32(b_d, a_d, 0));
+        acc_f32[1] = vfmaq_f32(acc_f32[1], vcvtq_f32_s32(row1),
+                               vmulq_laneq_f32(b_d, a_d, 1));
+        acc_f32[2] = vfmaq_f32(acc_f32[2], vcvtq_f32_s32(row2),
+                               vmulq_laneq_f32(b_d, a_d, 2));
+        acc_f32[3] = vfmaq_f32(acc_f32[3], vcvtq_f32_s32(row3),
+                               vmulq_laneq_f32(b_d, a_d, 3));
+
+        a_ptr++;
+        b_ptr++;
+      }
+
+      for (int row = 0; row < 4; row++) {
+        vst1q_f32(s + (y + row) * bs + x, acc_f32[row]);
+      }
+    }
+  }
+#else
+  float sumf[4][4];
+  int sumi;
+
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumf[m][j] = 0.0;
+        }
+      }
+      for (int l = 0; l < nb; l++) {
+        for (int k = 0; k < (qk / blocklen); k++) {
+          for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+              sumi = 0;
+              for (int i = 0; i < blocklen; ++i) {
+                const int v0 =
+                  b_ptr[l]
+                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
+              }
+              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+        }
+      }
+    }
+  }
+#endif
+}
+
+void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+
+  const int qk = QK8_0;
+  [[maybe_unused]] const int nb = n / qk;
+  [[maybe_unused]] const int ncols_interleaved = 4;
+  [[maybe_unused]] const int blocklen = 8;
+
+  assert(n % qk == 0);
+  assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx;
+
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+
+    for (int b = 0; b < nb; b++) {
+      int8x16x4_t b_low = vld1q_s8_x4((const int8_t *)b_ptr->qs);
+      int8x16x4_t b_high = vld1q_s8_x4((const int8_t *)b_ptr->qs + 64);
+      float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
+
+      int8x8x4_t a_chunks = vld1_s8_x4(a_ptr->qs);
+      int8x16_t a0 = vcombine_s8(a_chunks.val[0], a_chunks.val[0]);
+      int8x16_t a1 = vcombine_s8(a_chunks.val[1], a_chunks.val[1]);
+      int8x16_t a2 = vcombine_s8(a_chunks.val[2], a_chunks.val[2]);
+      int8x16_t a3 = vcombine_s8(a_chunks.val[3], a_chunks.val[3]);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
+
+      int32x4_t ret0 = vdupq_n_s32(0);
+      int32x4_t ret1 = vdupq_n_s32(0);
+
+      // 0..7
+      ret0 = vdotq_s32(ret0, b_low.val[0], a0);
+      ret1 = vdotq_s32(ret1, b_low.val[1], a0);
+      // 8..15
+      ret0 = vdotq_s32(ret0, b_low.val[2], a1);
+      ret1 = vdotq_s32(ret1, b_low.val[3], a1);
+      // 16..23
+      ret0 = vdotq_s32(ret0, b_high.val[0], a2);
+      ret1 = vdotq_s32(ret1, b_high.val[1], a2);
+      // 24..31
+      ret0 = vdotq_s32(ret0, b_high.val[2], a3);
+      ret1 = vdotq_s32(ret1, b_high.val[3], a3);
+
+      int32x4_t ret = vpaddq_s32(ret0, ret1);
+
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(ret),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      a_ptr++;
+      b_ptr++;
+    }
+    vst1q_f32(s, acc);
+    s += ncols_interleaved;
+  }
+#else
+  float sumf[4];
+  int sumi;
+
+  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+  for (int x = 0; x < nc / ncols_interleaved; x++) {
+    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+    for (int j = 0; j < ncols_interleaved; j++) {
+      sumf[j] = 0.0;
+    }
+    for (int l = 0; l < nb; l++) {
+      for (int k = 0; k < (qk / blocklen); k++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumi = 0;
+          for (int i = 0; i < blocklen; ++i) {
+            const int v0 =
+              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+            sumi += v0 * a_ptr[l].qs[k * blocklen + i];
+          }
+          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
+        }
+      }
+    }
+    for (int j = 0; j < ncols_interleaved; j++) {
+      s[x * ncols_interleaved + j] = sumf[j];
+    }
+  }
+#endif
 }
 
 void nntr_gemm_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
@@ -852,6 +1807,74 @@ void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
   }
 }
 
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k) {
+  assert(QK8_0 == 32);
+  assert(k % QK8_0 == 0);
+  const int nb = k / QK8_0;
+
+  block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
+
+  float32x4_t srcv[4][8];
+  float id[4];
+
+  for (int i = 0; i < nb; i++) {
+    float32x4_t asrcv[8];
+    float32x4_t amaxv[8];
+
+    for (int row_iter = 0; row_iter < 4; row_iter++) {
+      for (int j = 0; j < 8; j++)
+        srcv[row_iter][j] = vld1q_f32(x + row_iter * k + i * 32 + 4 * j);
+      for (int j = 0; j < 8; j++)
+        asrcv[j] = vabsq_f32(srcv[row_iter][j]);
+
+      for (int j = 0; j < 4; j++)
+        amaxv[2 * j] = vmaxq_f32(asrcv[2 * j], asrcv[2 * j + 1]);
+      for (int j = 0; j < 2; j++)
+        amaxv[4 * j] = vmaxq_f32(amaxv[4 * j], amaxv[4 * j + 2]);
+      for (int j = 0; j < 1; j++)
+        amaxv[8 * j] = vmaxq_f32(amaxv[8 * j], amaxv[8 * j + 4]);
+
+      const float amax = vmaxvq_f32(amaxv[0]);
+
+      const float d = amax / ((1 << 7) - 1);
+      id[row_iter] = d ? 1.0f / d : 0.0f;
+
+      y[i].d[row_iter] = nntr_compute_fp32_to_fp16(d);
+    }
+
+    for (int j = 0; j < 8; j++) {
+      float32x4_t v = vmulq_n_f32(srcv[0][j], id[0]);
+      int32x4_t vi = vcvtnq_s32_f32(v);
+      y[i].qs[16 * j + 0] = vgetq_lane_s32(vi, 0);
+      y[i].qs[16 * j + 1] = vgetq_lane_s32(vi, 1);
+      y[i].qs[16 * j + 2] = vgetq_lane_s32(vi, 2);
+      y[i].qs[16 * j + 3] = vgetq_lane_s32(vi, 3);
+
+      v = vmulq_n_f32(srcv[1][j], id[1]);
+      vi = vcvtnq_s32_f32(v);
+      y[i].qs[16 * j + 4] = vgetq_lane_s32(vi, 0);
+      y[i].qs[16 * j + 5] = vgetq_lane_s32(vi, 1);
+      y[i].qs[16 * j + 6] = vgetq_lane_s32(vi, 2);
+      y[i].qs[16 * j + 7] = vgetq_lane_s32(vi, 3);
+
+      v = vmulq_n_f32(srcv[2][j], id[2]);
+      vi = vcvtnq_s32_f32(v);
+      y[i].qs[16 * j + 8] = vgetq_lane_s32(vi, 0);
+      y[i].qs[16 * j + 9] = vgetq_lane_s32(vi, 1);
+      y[i].qs[16 * j + 10] = vgetq_lane_s32(vi, 2);
+      y[i].qs[16 * j + 11] = vgetq_lane_s32(vi, 3);
+
+      v = vmulq_n_f32(srcv[3][j], id[3]);
+      vi = vcvtnq_s32_f32(v);
+      y[i].qs[16 * j + 12] = vgetq_lane_s32(vi, 0);
+      y[i].qs[16 * j + 13] = vgetq_lane_s32(vi, 1);
+      y[i].qs[16 * j + 14] = vgetq_lane_s32(vi, 2);
+      y[i].qs[16 * j + 15] = vgetq_lane_s32(vi, 3);
+    }
+  }
+}
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
   assert(Q8_0 == 32);
@@ -885,61 +1908,22 @@ void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
       const float d = amax / ((1 << 7) - 1);
       id[row_iter] = d ? 1.0f / d : 0.0f;
 
-      y[i].d[row_iter] = nntr_compute_fp32_to_fp16(d);
+      y[i].d[row_iter] = nntr_fp32_to_fp16_inline(d);
     }
 
     for (int j = 0; j < 4; j++) {
-      float32x4_t v = vmulq_n_f32(srcv[0][2 * j], id[0]);
-      int32x4_t vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 0] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 1] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 2] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 3] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[0][2 * j + 1], id[0]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 4] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 5] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 6] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 7] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[1][2 * j], id[1]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 8] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 9] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 10] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 11] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[1][2 * j + 1], id[1]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 12] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 13] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 14] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 15] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[2][2 * j], id[2]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 16] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 17] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 18] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 19] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[2][2 * j + 1], id[2]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 20] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 21] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 22] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 23] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[3][2 * j], id[3]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 24] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 25] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 26] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 27] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[3][2 * j + 1], id[3]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 28] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 29] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 30] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 31] = vgetq_lane_s32(vi, 3);
+      // Quantized values fit in [-127, 127], so plain (non-saturating)
+      // narrowing matches the truncating int8 assignment of the scalar path.
+      int8x8_t q[4];
+      for (int row_iter = 0; row_iter < 4; row_iter++) {
+        const int32x4_t lo =
+          vcvtnq_s32_f32(vmulq_n_f32(srcv[row_iter][2 * j], id[row_iter]));
+        const int32x4_t hi =
+          vcvtnq_s32_f32(vmulq_n_f32(srcv[row_iter][2 * j + 1], id[row_iter]));
+        q[row_iter] = vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi)));
+      }
+      vst1q_s8(&y[i].qs[32 * j + 0], vcombine_s8(q[0], q[1]));
+      vst1q_s8(&y[i].qs[32 * j + 16], vcombine_s8(q[2], q[3]));
     }
   }
 }
@@ -1008,6 +1992,25 @@ static block_q4_0x8 nntr_make_block_q4_0x8(block_q4_0 *in,
     memcpy(&out.qs[dst_offset], &elems, sizeof(uint64_t));
   }
 
+  return out;
+}
+
+static block_q8_0x4 nntr_make_block_q8_0x4(block_q8_0 *in,
+                                           unsigned int blck_size_interleave) {
+  block_q8_0x4 out;
+
+  for (int i = 0; i < 4; i++) {
+    out.d[i] = in[i].d;
+  }
+
+  const int end = QK8_0 * 4 / blck_size_interleave;
+  for (int i = 0; i < end; ++i) {
+    int src_id = i % 4;
+    int src_offset = (i / 4) * blck_size_interleave;
+    int dst_offset = i * blck_size_interleave;
+    memcpy(&out.qs[dst_offset], &in[src_id].qs[src_offset],
+           blck_size_interleave);
+  }
   return out;
 }
 
@@ -1142,6 +2145,35 @@ int nntr_repack_q4_0_to_q4_0_8_bl(void *__restrict dst, int interleave_block,
         dst_tmp[i] = src[x + i * nblocks];
       }
       *dst_++ = nntr_make_block_q4_0x8(dst_tmp, interleave_block);
+    }
+    src += nrows_interleaved * nblocks;
+  }
+  return 0;
+}
+
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k) {
+  assert(interleave_block == 4 || interleave_block == 8);
+  constexpr int nrows_interleaved = 4;
+
+  block_q8_0x4 *dst_ = (block_q8_0x4 *)dst;
+  const block_q8_0 *src = (const block_q8_0 *)data;
+  block_q8_0 dst_tmp[4];
+  int nblocks = k / QK8_0;
+
+  assert(data_size == nrow * nblocks * sizeof(block_q8_0));
+
+  if (nrow % nrows_interleaved != 0 || k % 8 != 0) {
+    return -1;
+  }
+
+  for (int b = 0; b < nrow; b += nrows_interleaved) {
+    for (int64_t x = 0; x < nblocks; x++) {
+      for (int i = 0; i < nrows_interleaved; i++) {
+        dst_tmp[i] = src[x + i * nblocks];
+      }
+      *dst_++ = nntr_make_block_q8_0x4(dst_tmp, interleave_block);
     }
     src += nrows_interleaved * nblocks;
   }

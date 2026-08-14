@@ -128,7 +128,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
  * @param K as descripted above
  * @param A Activation
  * @param lda leading dimension of A
- * @param Bs vector of offline quantized and packed q4_kx8 Weights
+ * @param Bs vector of offline quantized and packed q4_0x8 Weights
  * @param ldbs vector of leading dimension of B
  * @param C vector of dst matrices
  * @param ldcs vector of leading dimension of C
@@ -150,7 +150,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M,
  * @param K as descripted above
  * @param A Activation
  * @param lda leading dimension of A
- * @param B offline quantized and packed q4_0x8 Weight
+ * @param B offline quantized and packed q4_0x4 Weight
  * @param ldb leading dimension of B
  * @param C dst matrix
  * @param ldc leading dimension of C
@@ -170,7 +170,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
  * @param K as descripted above
  * @param A Activation
  * @param lda leading dimension of A
- * @param Bs vector of offline quantized and packed q4_kx8 Weights
+ * @param Bs vector of offline quantized and packed q4_0x4 Weights
  * @param ldbs vector of leading dimension of B
  * @param C vector of dst matrices
  * @param ldcs vector of leading dimension of C
@@ -183,6 +183,45 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
                                std::vector<unsigned int> ldbs,
                                std::vector<T *> C,
                                std::vector<unsigned int> ldcs);
+
+/**
+ * @brief A(M, K) * W.T(N, K) = (M, N)
+ *
+ * @param M as descripted above
+ * @param N as descripted above
+ * @param K as descripted above
+ * @param A Activation
+ * @param lda leading dimension of A
+ * @param B offline quantized and packed q8_0x4 Weight
+ * @param ldb leading dimension of B
+ * @param C dst matrix
+ * @param ldc leading dimension of C
+ */
+void __ggml_q8_0_4x4_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, const void *B,
+                               const unsigned int ldb, float *C,
+                               const unsigned int ldc);
+
+/**
+ * @brief A(M, K) * W.T(N, K) = (M, N)
+ *
+ * @param M as descripted above
+ * @param N as descripted above
+ * @param K as descripted above
+ * @param A Activation
+ * @param lda leading dimension of A
+ * @param B offline quantized and packed q8_0x4 Weight
+ * @param ldb leading dimension of B
+ * @param C dst matrix
+ * @param ldc leading dimension of C
+ */
+void __ggml_q8_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, const void *B,
+                               const unsigned int ldb, float *C,
+                               const unsigned int ldc);
+
 /**
  * @brief A(M, K) * W.T(N, K) = (M, N)
  *
@@ -329,6 +368,30 @@ void __ggml_repack_q4_0_to_q4_0_4(void *dst, void *src, size_t data_size,
  */
 void __ggml_repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,
                                   const unsigned int M, const unsigned int N);
+
+/**
+ * @brief repack q80 to q80x4 with interleave block 4
+ *
+ * @param dst output repacked q80x4
+ * @param src input q80
+ * @param data_size total weight size
+ * @param M number of rows
+ * @param N number of columns
+ */
+void __ggml_repack_q8_0_to_q8_0_4x4(void *dst, void *src, size_t data_size,
+                                    const unsigned int M, const unsigned int N);
+/**
+ * @brief repack q80 to q80x4 with interleave block 8
+ *
+ * @param dst output repacked q80x4
+ * @param src input q80
+ * @param data_size total weight size
+ * @param M number of rows
+ * @param N number of columns
+ */
+void __ggml_repack_q8_0_to_q8_0_4x8(void *dst, void *src, size_t data_size,
+                                    const unsigned int M, const unsigned int N);
+
 /**
  * @brief repack q4K to q4Kx8
  *

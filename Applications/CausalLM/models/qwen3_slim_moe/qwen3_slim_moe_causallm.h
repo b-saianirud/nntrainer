@@ -3,6 +3,7 @@
  * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
  *
  * @file   qwen3_moe_causallm.h
+ * @brief  Slimmed-down Qwen3-MoE causal language model implementation.
  * @date   15 July 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
@@ -35,9 +36,8 @@ public:
 
   virtual ~Qwen3SlimMoECausalLM() = default;
 
-  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                     int hidden_dim,
-                                     std::string input_name) override;
+  Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                   Tensor input) override;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;

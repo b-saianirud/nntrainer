@@ -8,7 +8,9 @@ util_sources = [
   'fp16.cpp',
   'util_simd.cpp',
   'mman_windows.cpp',
-  'bs_thread_pool_manager.cpp'
+  'thread_manager.cpp',
+  'thread_manager_util.cpp',
+  'safetensors_util.cpp',
 ]
 
 util_headers = [
@@ -21,11 +23,12 @@ util_headers = [
   'util_simd.h',
   'dynamic_library_loader.h',
   'mman_windows.h',
-  'bs_thread_pool.h',
-  'bs_thread_pool_manager.hpp',
   'singleton.h',
   'nonmovable.h',
   'noncopyable.h',
+  'thread_manager.h',
+  'thread_manager_util.h',
+  'safetensors_util.h',
 ]
 
 if get_option('enable-trace')

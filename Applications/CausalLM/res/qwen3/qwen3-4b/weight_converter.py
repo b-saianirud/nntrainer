@@ -3,16 +3,18 @@
 ## @author Eunju Yang <ej.yang@samsung.com>
 
 import argparse
-import torch
+
 import numpy as np
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM
 
 total_size = 0
-def save_qwen3_for_nntrainer(params, n_layers, dtype, file):  
+def save_qwen3_for_nntrainer(params, config, dtype, file):  
     """Convert and save weights as nntrainer format for multi-head attention model"""  
+    n_layers = config.num_hidden_layers
       
     def save_weight(weight):
-        np.array(weight, dtype=dtype).tofile(file)  
+        np.array(weight.detach().cpu(), dtype=dtype).tofile(file)  
 
     def save_projection(layer_name, proj_name):  
         """Helper function to handle base/lora weight saving"""  
@@ -42,7 +44,7 @@ def save_qwen3_for_nntrainer(params, n_layers, dtype, file):
         save_weight(params[f"{layer_name}post_attention_layernorm.weight"])  
           
         # Save MLP projections using helper  
-        for proj in ["up_proj", "gate_proj", "down_proj"]:  
+        for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(layer_name, f"mlp.{proj}")  
 
     # Save embedding layer  
@@ -56,7 +58,9 @@ def save_qwen3_for_nntrainer(params, n_layers, dtype, file):
 
     # Save final layers  
     save_weight(params["model.norm.weight"])  
-    save_weight(params["lm_head.weight"].permute(1, 0))  
+
+    if not getattr(config, "tie_word_embeddings", False):
+        save_weight(params["lm_head.weight"].permute(1, 0))
 
 
 if __name__ == "__main__":
@@ -71,10 +75,10 @@ if __name__ == "__main__":
     output_name = args.output_name
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype="float", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float32, trust_remote_code=True)
     model.eval()
 
     with open(output_name, "wb") as f_model :
-        save_qwen3_for_nntrainer(model.state_dict(), config.num_hidden_layers, data_dtype, f_model)
+        save_qwen3_for_nntrainer(model.state_dict(), config, data_dtype, f_model)

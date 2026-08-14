@@ -64,6 +64,8 @@ log_step "2/3" "Check build artifacts"
 REQUIRED_FILES=(
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info"
 )
 
 # Optional dependency files (might not be in libs/arm64-v8a depending on build)
@@ -150,8 +152,8 @@ adb shell "mkdir -p $INSTALL_DIR"
 adb shell "mkdir -p $MODEL_DIR"
 log_success "Directories created"
 
-# Push executable
-log_info "Pushing executable..."
+# Push executables
+log_info "Pushing executables..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm" "$INSTALL_DIR/" 2>&1 | tail -1
 adb shell "chmod 755 $INSTALL_DIR/nntrainer_causallm"
 log_success "nntrainer_causallm pushed"
@@ -164,28 +166,32 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     log_success "test_api pushed"
 fi
 
+
+log_info "Pushing nntr_quantize..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
+log_success "nntr_quantize pushed"
+
+log_info "Pushing nntr_safetensors_info..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_safetensors_info"
+log_success "nntr_safetensors_info pushed"
+
 # Push shared libraries
 log_info "Pushing shared libraries..."
-log_info "  [1/6] libcausallm_core.so (CausalLM Core library)..."
+log_info "  [1/5] libcausallm_core.so (CausalLM Core library)..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so" "$INSTALL_DIR/" 2>&1 | tail -1
 
-log_info "  [2/6] libnntrainer.so (nntrainer library)..."
+log_info "  [2/5] libnntrainer.so (nntrainer library)..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libnntrainer.so" "$INSTALL_DIR/" 2>&1 | tail -1
 
-log_info "  [3/6] libccapi-nntrainer.so (nntrainer C/C API)..."
+log_info "  [3/5] libccapi-nntrainer.so (nntrainer C/C API)..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libccapi-nntrainer.so" "$INSTALL_DIR/" 2>&1 | tail -1
 
-log_info "  [4/6] libc++_shared.so (C++ runtime)..."
+log_info "  [4/5] libc++_shared.so (C++ runtime)..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libc++_shared.so" "$INSTALL_DIR/" 2>&1 | tail -1
 
-log_info "  [5/6] libomp.so (OpenMP runtime)..."
-if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/libomp.so" ]; then
-    adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libomp.so" "$INSTALL_DIR/" 2>&1 | tail -1
-else
-    log_warning "libomp.so not found (skipping)"
-fi
-
-log_info "  [6/6] libcausallm_api.so (CausalLM API library)..."
+log_info "  [5/5] libcausallm_api.so (CausalLM API library)..."
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_api.so" ]; then
     adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_api.so" "$INSTALL_DIR/" 2>&1 | tail -1
 else
@@ -199,19 +205,38 @@ log_info "Creating run script on device..."
 adb shell "cat > $INSTALL_DIR/run_causallm.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
-export OMP_NUM_THREADS=4
+export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
 ./nntrainer_causallm \$@
 EOF
 "
 adb shell "chmod 755 $INSTALL_DIR/run_causallm.sh"
 
+# Create quantize run script on device
+adb shell "cat > $INSTALL_DIR/run_quantize.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+cd $INSTALL_DIR
+./nntr_quantize \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_quantize.sh"
+
+# Create safetensors_info run script on device
+adb shell "cat > $INSTALL_DIR/run_safetensors_info.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+cd $INSTALL_DIR
+./nntr_safetensors_info \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_safetensors_info.sh"
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
 #!/system/bin/sh
 export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
-export OMP_NUM_THREADS=4
+export NNTR_NUM_THREADS=4
 cd $INSTALL_DIR
 ./test_api \$@
 EOF
@@ -238,13 +263,15 @@ fi
 log_info "  - libnntrainer.so"
 log_info "  - libccapi-nntrainer.so"
 log_info "  - libc++_shared.so"
-log_info "  - libomp.so (if available)"
 log_header "How to run"
 log_info "To run CausalLM on the device:"
 log_info "  1. Push your model files to: $MODEL_DIR/"
 log_info "      Example: adb push res/qwen3/qwen3-4b $MODEL_DIR/qwen3-4b/"
 log_info "2. Run the application:"
 log_info "   adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-4b"
+log_info ""
+log_info "(optional) Run quantization:"
+log_info "  adb shell $INSTALL_DIR/run_quantize.sh $MODEL_DIR/qwen3-4b --fc_dtype Q4_0"
 log_info ""
 log_info "For interactive shell:"
 log_info "   adb shell"

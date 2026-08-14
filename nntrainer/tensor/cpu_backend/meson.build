@@ -1,6 +1,11 @@
 cpu_backend_headers = [
   'cpu_backend.h',
+  'compute_ops.h',
+  'cpu_ops_table.h',
 ]
+
+nntrainer_sources += meson.current_source_dir() / 'compute_ops.cpp'
+nntrainer_sources += meson.current_source_dir() / 'cpu_ops_table.cpp'
 
 subdir('fallback')
 nntrainer_inc += include_directories('fallback')

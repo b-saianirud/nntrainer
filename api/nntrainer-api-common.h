@@ -75,7 +75,7 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_CONV2D_TRANSPOSE =
     37, /**< Convolution 2D Transpose Layer (Since 9.0) */
   ML_TRAIN_LAYER_TYPE_POW = 38,     /**< Pow Layer type (Since 9.0)*/
-  ML_TRAIN_LAYER_TYPE_TENSOR = 39,  /**< Tensor Layer type (Since 9.0)*/
+  ML_TRAIN_LAYER_TYPE_TENSOR = 39,  /**< Tensor Layer type (Deprecated)*/
   ML_TRAIN_LAYER_TYPE_SQRT = 40,    /**< SQRT Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_SINE = 41,    /**< Sine Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_COSINE = 42,  /**< Cosine Layer type (Since 9.0)*/
@@ -288,7 +288,9 @@ typedef enum {
   ML_TRAIN_MODEL_FORMAT_ONNX =
     4, /**< QNNX binary format file saves model configurations and weights. */
   ML_TRAIN_MODEL_FORMAT_QNN =
-    5 /**< QNN binary format file saves model configurations and weights. */
+    5, /**< QNN binary format file saves model configurations and weights. */
+  ML_TRAIN_MODEL_FORMAT_SAFETENSORS =
+    6 /**< Safetensors format file saves model weights. */
 } ml_train_model_format_e;
 
 /**

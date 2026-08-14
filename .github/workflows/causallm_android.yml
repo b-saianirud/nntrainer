@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -14,12 +18,20 @@ jobs:
       with:
         fetch-depth: 0
 
-    - uses: nttld/setup-ndk@v1
+    # Skip the heavy build for doc-only PRs
+    # env.rebuild == '1' means PR contains non doc changes
+    - name: Check if rebuild required
+      if: github.event_name == 'pull_request'
+      uses: ./.github/actions/check-rebuild
+
+    - if: github.event_name != 'pull_request' || env.rebuild == '1'
+      uses: nttld/setup-ndk@v1
       with:
         ndk-version: r26d
         link-to-sdk: true
 
     - name: Install required packages
+      if: github.event_name != 'pull_request' || env.rebuild == '1'
       run: |
         sudo apt-get update
         sudo apt-get install -y tar wget gzip libglib2.0-dev libjson-glib-dev \
@@ -29,9 +41,11 @@ jobs:
           libflatbuffers-dev flatbuffers-compiler protobuf-compiler
 
     - name: Install submodules
+      if: github.event_name != 'pull_request' || env.rebuild == '1'
       run: git submodule sync && git submodule update --init --recursive
 
     - name: Install Rust
+      if: github.event_name != 'pull_request' || env.rebuild == '1'
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
@@ -40,6 +54,7 @@ jobs:
         components: rustfmt, clippy
 
     - name: Build CausalLM for Android
+      if: github.event_name != 'pull_request' || env.rebuild == '1'
       run: |
         chmod +x Applications/CausalLM/build_android.sh
         chmod +x Applications/CausalLM/build_tokenizer_android.sh

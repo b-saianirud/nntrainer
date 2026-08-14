@@ -24,12 +24,18 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <compute_ops.h>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -51,6 +57,7 @@
 #include <profiler.h>
 #include <recurrent_realizer.h>
 #include <remap_realizer.h>
+#include <safetensors_util.h>
 #include <slice_realizer.h>
 #include <util_func.h>
 
@@ -66,6 +73,40 @@
 #define ML_TRAIN_SUMMARY_MODEL_VALID_ACCURACY 103
 
 namespace nntrainer {
+
+namespace {
+
+Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
+  const unsigned int bytes = static_cast<unsigned int>(
+    static_cast<size_t>(dim.getDataLen()) * dim.getDataTypeSize());
+
+  switch (dim.getDataType()) {
+  case TensorDim::DataType::FP16:
+  case TensorDim::DataType::UINT16:
+  case TensorDim::DataType::QINT16:
+    return Tensor::Map<uint16_t>(reinterpret_cast<uint16_t *>(buf), bytes, dim,
+                                 0);
+  case TensorDim::DataType::UINT8:
+  case TensorDim::DataType::UINT4:
+  case TensorDim::DataType::QINT8:
+  case TensorDim::DataType::QINT4:
+  case TensorDim::DataType::Q4_K:
+  case TensorDim::DataType::Q6_K:
+  case TensorDim::DataType::Q4_0:
+    return Tensor::Map<uint8_t>(reinterpret_cast<uint8_t *>(buf), bytes, dim,
+                                0);
+  case TensorDim::DataType::UINT32:
+  case TensorDim::DataType::BCQ:
+    return Tensor::Map<uint32_t>(reinterpret_cast<uint32_t *>(buf), bytes, dim,
+                                 0);
+  case TensorDim::DataType::FP32:
+  case TensorDim::DataType::NONE:
+  default:
+    return Tensor::Map<float>(buf, bytes, dim, 0);
+  }
+}
+
+} // namespace
 
 NeuralNetwork::NeuralNetwork() :
   model_props(props::LossType(), {}, {}, props::ClipGradByGlobalNorm(),
@@ -186,8 +227,35 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
+  bool has_qnn_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->getComputeEngineType() == "qnn" ||
+        node->getType() == "qnn_graph") {
+      has_qnn_engine = true;
+      break;
+    }
+  }
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
+
+  // QNN/HTP graphs register their I/O tensors with the DSP via rpcmem_to_fd(),
+  // which requires those buffers to be rpcmem (DMA/ION). Route ONLY the
+  // activation pool to the "qnn" (rpcmem) allocator; the weight pool stays on
+  // CPU. The nntrainer weight pool is NOT DSP-registered (QNN graph weights are
+  // loaded by the QNN context loader), so routing weights to rpcmem too would
+  // needlessly exhaust the scarce CMA pool — observed as rpcmem_to_fd failures
+  // after a few generated tokens once the app UI's GPU dmabuf also draws on
+  // CMA. Mirrors the upstream setComputeBackend("", "npu") tensor-only design
+  // (here the QNN context registers under the name "qnn").
+  if (has_qnn_engine)
+    model_graph.setComputeBackend("", "qnn");
+
+  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
+  // their addresses must stay stable across decode tokens. Let inference()
+  // reuse the pool (allocate once) instead of reallocating per call. CPU/GPU
+  // keep the realloc-per-call behavior they need for correct tensor state.
+  reuse_inference_tensor_pool_ = has_qnn_engine;
 
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));
@@ -617,10 +685,34 @@ void NeuralNetwork::backwarding(int iteration,
   }
 }
 
+namespace {
+
+/**
+ * @brief Resolve the data type a weight will actually be stored as.
+ *
+ * Mirrors the per-weight policy of the layer save overrides: bias-like tensors
+ * (height == 1) are not block-quantized and stay in their original type.
+ */
+TensorDim::DataType resolveStoredDtype(const Tensor &weight,
+                                       TensorDim::DataType requested) {
+  if (requested == TensorDim::DataType::NONE ||
+      requested == weight.getDataType())
+    return weight.getDataType();
+
+  if (nntrainer::safetensors::isQuantized(requested) &&
+      weight.getDim().height() == 1)
+    return weight.getDataType();
+
+  return requested;
+}
+
+} // namespace
+
 void NeuralNetwork::save(
   const std::string &file_path, ml::train::ModelFormat format,
   TensorDim::DataType dtype,
-  const std::map<std::string, TensorDim::DataType> &layer_dtype_map) {
+  const std::map<std::string, TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
   NNTR_THROW_IF(!initialized, std::runtime_error)
     << "Cannot save model if not initialized yet, path: " << file_path
     << " format: " << static_cast<unsigned>(format);
@@ -642,7 +734,7 @@ void NeuralNetwork::save(
       const auto &layer_node = *iter;
       auto it = layer_dtype_map.find(layer_node->getName());
       auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
-      layer_node->save(model_file, false, exec_mode, target_dtype);
+      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
     }
 
     if (opt && istrequal(opt->getType(), "adam")) {
@@ -679,6 +771,161 @@ void NeuralNetwork::save(
   case ml::train::ModelFormat::MODEL_FORMAT_ONNX: {
     throw nntrainer::exception::not_supported(
       "saving with ONNX format is not supported yet.");
+    break;
+  }
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    // Delegate the data section to the same per-layer save() the BIN path
+    // uses so the quantized bytes are byte-identical: each layer override
+    // applies its own quantization policy (e.g. embedding/tie-word-embedding
+    // do not transpose, shared weights are written once on first access),
+    // which a generic quantizer here could not replicate. Bytes go to a temp
+    // file first so per-weight sizes are known before the header is written.
+    const std::string tmp_path = file_path + ".nntrtmp";
+    std::vector<safetensors::TensorEntry> entries;
+
+    {
+      auto tmp_file = checkedOpenStream<std::ofstream>(
+        tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+      std::unordered_set<const Tensor *> visited_st;
+      size_t data_offset = 0;
+
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           iter++) {
+        const auto &layer_node = *iter;
+        auto it = layer_dtype_map.find(layer_node->getName());
+        const auto requested =
+          (it != layer_dtype_map.end()) ? it->second : dtype;
+        auto &rc = layer_node->getRunContext();
+
+        // Collect the weights this layer will actually write: first-access
+        // only (shared weights are saved once), deduped across the graph.
+        struct WInfo {
+          const Tensor *t;
+          TensorDim::DataType stored;
+        };
+        std::vector<WInfo> wlist;
+        for (unsigned int i = 0; i < rc.getNumWeights(); ++i) {
+          if (!rc.isGradientFirstAccess(i))
+            continue;
+          const Tensor &t = rc.getWeight(i);
+          if (!visited_st.insert(&t).second)
+            continue;
+          wlist.push_back({&t, resolveStoredDtype(t, requested)});
+        }
+
+        // Write this layer's weights exactly as the BIN path would.
+        const auto start = static_cast<size_t>(tmp_file.tellp());
+        layer_node->save(tmp_file, false, exec_mode, requested, target_isa);
+        const auto layer_bytes = static_cast<size_t>(tmp_file.tellp()) - start;
+
+        // Map the written bytes back to per-weight header entries. At most one
+        // weight per layer is block-quantized; the rest are stored as-is, so
+        // the quantized weight's size is whatever remains.
+        size_t known = 0;
+        int quant_count = 0;
+        for (const auto &w : wlist) {
+          if (safetensors::isQuantized(w.stored))
+            ++quant_count;
+          else
+            known += w.t->getMemoryBytes();
+        }
+        NNTR_THROW_IF(quant_count > 1, std::runtime_error)
+          << "safetensors save: layer '" << layer_node->getName()
+          << "' has multiple quantized weights, which is not supported.";
+
+        size_t assigned = 0;
+        for (const auto &w : wlist) {
+          const auto &dim = w.t->getDim();
+          const bool is_quant = safetensors::isQuantized(w.stored);
+          const size_t wsize =
+            is_quant ? (layer_bytes - known) : w.t->getMemoryBytes();
+
+          safetensors::TensorEntry entry;
+          entry.name = w.t->getName();
+          entry.offset_start = data_offset;
+          entry.offset_end = data_offset + wsize;
+          if (is_quant) {
+            // Quantized blobs are opaque bytes (U8) with a 1-D byte shape;
+            // the native type and logical shape live in extension fields.
+            entry.dtype = safetensors::dtypeToString(w.stored); // "U8"
+            entry.shape = {wsize};
+            entry.nntr_dtype = safetensors::nntrDtypeName(w.stored);
+            entry.nntr_shape = {dim.batch(), dim.channel(), dim.height(),
+                                dim.width()};
+          } else {
+            entry.dtype = safetensors::dtypeToString(w.stored);
+            entry.shape = {dim.batch(), dim.channel(), dim.height(),
+                           dim.width()};
+          }
+          entries.push_back(std::move(entry));
+          data_offset += wsize;
+          assigned += wsize;
+        }
+
+        NNTR_THROW_IF(assigned != layer_bytes, std::runtime_error)
+          << "safetensors save: byte accounting mismatch for layer '"
+          << layer_node->getName() << "' (wrote " << layer_bytes << ", mapped "
+          << assigned << ").";
+      }
+
+      tmp_file.close();
+    }
+
+    // Embed an nntrainer dtype summary so a quantized file can be inspected
+    // and identified without an accompanying nntr_config.json.
+    std::map<std::string, std::string> metadata;
+    bool any_quant = false;
+    bool any_q4_0 = false;
+    for (const auto &e : entries) {
+      any_quant = any_quant || !e.nntr_dtype.empty();
+      any_q4_0 = any_q4_0 || e.nntr_dtype == "Q4_0";
+    }
+    if (any_quant)
+      metadata["nntr_format"] = "nntr-safetensors-v1";
+    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4)
+    // that is indistinguishable from the header alone, so record which one was
+    // produced. DEFAULT resolves to the build platform's layout. Only emitted
+    // when a Q4_0 tensor is present, since no other type depends on the ISA.
+    if (any_q4_0) {
+      const char *isa_str;
+      switch (target_isa) {
+      case ml::train::ISA::X86:
+        isa_str = "x86";
+        break;
+      case ml::train::ISA::ARM:
+        isa_str = "arm";
+        break;
+      default: // DEFAULT -> the compiled backend's layout
+#if defined(__aarch64__) || defined(__arm__)
+        isa_str = "arm";
+#else
+        isa_str = "x86";
+#endif
+        break;
+      }
+      metadata["nntr_q4_0_isa"] = isa_str;
+    }
+
+    // Write: [8-byte header_size][header (padded to 8)][raw weight data]
+    const std::string header_json = safetensors::buildHeader(entries, metadata);
+    const uint64_t header_size = static_cast<uint64_t>(header_json.size());
+    // safetensors layout: [8-byte header length][header JSON][tensor raw data]
+    auto st_file = checkedOpenStream<std::ofstream>(
+      file_path, std::ios::out | std::ios::binary | std::ios::trunc);
+    // [8-byte header length]
+    st_file.write(reinterpret_cast<const char *>(&header_size),
+                  sizeof(header_size));
+    // [header JSON: per-tensor dtype/shape/offsets + __metadata__]
+    st_file.write(header_json.data(),
+                  static_cast<std::streamsize>(header_json.size()));
+    // [tensor raw data]
+    {
+      std::ifstream data_in(tmp_path, std::ios::in | std::ios::binary);
+      st_file << data_in.rdbuf();
+    }
+    st_file.close();
+    std::remove(tmp_path.c_str());
     break;
   }
   default:
@@ -723,7 +970,8 @@ void NeuralNetwork::load(const std::string &file_path,
       if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
-          tensor_data_type != TensorDim::DataType::Q4_0) {
+          tensor_data_type != TensorDim::DataType::Q4_0 &&
+          tensor_data_type != TensorDim::DataType::QS4CX) {
         // for tensor with qparam
         size += sizeof(uint16_t);
       }
@@ -752,21 +1000,32 @@ void NeuralNetwork::load(const std::string &file_path,
 #endif
 
     if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
-      if (!MMAP_READ) {
-        ///@note for slim-tensor. This should be removed.
-        model_file_fd = open(f_path.c_str(), O_RDONLY);
-        NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
-          << "Cannot open file : " << f_path;
-      }
-      // std::vector<std::future<void>> futures;
-      std::vector<std::thread> threads;
-      threads.reserve(model_graph.size());
-      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
-           ++iter) {
-        auto node = *iter;
-        auto exec_order = std::get<0>((*iter)->getExecutionOrder());
+      // Always keep a long-lived fd open during inference. Virtual (slim)
+      // tensors capture this fd at read-time and use it later in activate()
+      // to mmap their backing region on demand. Without it, virtual tensors
+      // end up with fd=-1 and activate() returns MAP_FAILED, segfaulting on
+      // first use (e.g. SlimMoE expert weights when MMAP_READ=true).
+      model_file_fd = open(f_path.c_str(), O_RDONLY);
+      NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
+        << "Cannot open file : " << f_path;
 
-        threads.emplace_back([&, node]() {
+      // Load weights with bounded thread number not to exceed mmap limits
+      constexpr size_t MAX_LOAD_THREADS = 8;
+      std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
+                                                         model_graph.cend());
+      const size_t num_load_nodes = load_nodes.size();
+      const size_t num_load_threads =
+        std::min<size_t>(num_load_nodes, MAX_LOAD_THREADS);
+
+      std::atomic<size_t> next_load_index{0};
+
+      auto load_worker = [&]() {
+        for (size_t idx =
+               next_load_index.fetch_add(1, std::memory_order_relaxed);
+             idx < num_load_nodes;
+             idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
+          auto node = load_nodes[idx];
+
           if (!MMAP_READ) {
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
@@ -793,7 +1052,7 @@ void NeuralNetwork::load(const std::string &file_path,
               << "MapViewOfFile failed";
 
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
 
             // Early unmap: let the OS reclaim the working set ASAP
             UnmapViewOfFile(view);
@@ -822,7 +1081,7 @@ void NeuralNetwork::load(const std::string &file_path,
 
             char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
 
             // Early drop: pages no longer needed; helps lower peak RSS during
             // overlap
@@ -831,12 +1090,19 @@ void NeuralNetwork::load(const std::string &file_path,
             ::munmap(mmap_ptr, f_size);
 #endif
           }
-        });
+        }
+      };
+
+      std::vector<std::thread> threads;
+      threads.reserve(num_load_threads);
+      for (size_t t = 0; t < num_load_threads; ++t) {
+        threads.emplace_back(load_worker);
       }
       for (auto &t : threads) {
         if (t.joinable())
           t.join();
       }
+
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
@@ -931,6 +1197,137 @@ void NeuralNetwork::load(const std::string &file_path,
     }
 
     qnn_load.join();
+    break;
+  }
+  case ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS: {
+    NNTR_THROW_IF(!initialized, std::runtime_error)
+      << "Cannot load safetensors if not initialized yet, path: " << file_path;
+
+    const auto f_path = (v.size() == 2) ? v[1] : v[0];
+
+    // Read header_size (8 bytes) + header JSON
+    std::ifstream st_file(f_path, std::ios::in | std::ios::binary);
+    NNTR_THROW_IF(!st_file.is_open(), std::runtime_error)
+      << "Cannot open safetensors file: " << f_path;
+
+    uint64_t header_size = 0;
+    st_file.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+    NNTR_THROW_IF(!st_file, std::runtime_error)
+      << "Failed to read safetensors header length from: " << f_path;
+
+    std::string header_json(header_size, '\0');
+    st_file.read(header_json.data(), static_cast<std::streamsize>(header_size));
+    NNTR_THROW_IF(!st_file, std::runtime_error)
+      << "Failed to read safetensors header from: " << f_path;
+    st_file.close();
+
+    // data_base: byte offset in file where the data section starts
+    const size_t data_base =
+      sizeof(uint64_t) + static_cast<size_t>(header_size);
+
+    // Parse header: name -> (offset_start, size_in_bytes)
+    auto name_offset_map = safetensors::parseHeader(header_json);
+
+    // Assign file offsets to each weight by name
+    std::unordered_set<const Tensor *> visited_st;
+    for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+      auto weights = (*iter)->getRunContext().getWeights();
+      for (auto weight : weights) {
+        if (!visited_st.insert(&weight->getVariableRef()).second)
+          continue;
+        const std::string &name = weight->getName();
+        auto it = name_offset_map.find(name);
+        if (it == name_offset_map.end())
+          continue;
+        const size_t file_off = data_base + it->second.first;
+        weight->getVariableRef().setFileOffset(file_off);
+      }
+    }
+
+    if (exec_mode == ml::train::ExecutionMode::INFERENCE) {
+      model_file_fd = ::open(f_path.c_str(), O_RDONLY);
+      NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
+        << "Cannot open safetensors file: " << f_path;
+
+      std::vector<std::thread> threads;
+      threads.reserve(model_graph.size());
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        auto node = *iter;
+        threads.emplace_back([&, node]() {
+          if (!MMAP_READ) {
+            auto local_file = checkedOpenStream<std::ifstream>(
+              f_path, std::ios::in | std::ios::binary);
+            node->read(local_file, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+          } else {
+#if defined(_WIN32)
+            HANDLE hFile =
+              CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
+              << "CreateFileA failed for safetensors file: " << f_path;
+
+            HANDLE hMap =
+              CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+            NNTR_THROW_IF((hMap == NULL), std::runtime_error)
+              << "CreateFileMapping failed for safetensors file: " << f_path;
+
+            char *view =
+              static_cast<char *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+            NNTR_THROW_IF((view == nullptr), std::runtime_error)
+              << "MapViewOfFile failed for safetensors file: " << f_path;
+
+            node->read(view, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+
+            UnmapViewOfFile(view);
+            CloseHandle(hMap);
+            CloseHandle(hFile);
+#else
+            int fd = ::open(f_path.c_str(), O_RDONLY);
+            NNTR_THROW_IF((fd == -1), std::invalid_argument)
+              << "Cannot open safetensors file: " << f_path;
+
+            struct stat st {};
+            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+              << "Cannot stat safetensors file: " << f_path;
+
+            const size_t f_size = static_cast<size_t>(st.st_size);
+            void *mmap_ptr =
+              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd);
+            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+              << "mmap failed for safetensors file: " << f_path;
+
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+
+            char *view = static_cast<char *>(mmap_ptr);
+            node->read(view, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            ::munmap(mmap_ptr, f_size);
+#endif
+          }
+        });
+      }
+      for (auto &t : threads) {
+        if (t.joinable())
+          t.join();
+      }
+    } else {
+      // TRAINING mode: sequential read
+      std::ifstream st_in(f_path, std::ios::in | std::ios::binary);
+      NNTR_THROW_IF(!st_in.is_open(), std::runtime_error)
+        << "Cannot open safetensors file for training load: " << f_path;
+      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+           ++iter) {
+        (*iter)->read(st_in, false, exec_mode, fsu_mode);
+      }
+    }
+
+    ml_logi("read safetensors model file: %s", f_path.c_str());
     break;
   }
   default:
@@ -1044,7 +1441,22 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
-  allocate(ExecutionMode::INFERENCE);
+  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
+  // their address must stay stable across decode tokens. For QNN graphs reuse
+  // the already-allocated pool (allocate once) instead of the per-call
+  // deallocateTensors()+allocateTensors() that allocate() does: reallocating
+  // every token hands out NEW rpcmem addresses, defeats registerQnnTensor()'s
+  // findMatchingPtr cache (every token re-runs rpcmem_to_fd()+memRegister()),
+  // and churns the scarce contiguous CMA pool until rpcmem_to_fd fails under
+  // the app UI's GPU dmabuf pressure. allocateTensors() no-ops when already
+  // allocated; a free_mem=true caller deallocates at the end so the next call
+  // re-allocates. CPU/GPU keep the realloc-per-call behavior — reusing the pool
+  // there yields degenerate output (verified: gemma4 CPU loops "... is ...
+  // is").
+  if (reuse_inference_tensor_pool_)
+    model_graph.allocateTensors(ExecutionMode::INFERENCE);
+  else
+    allocate(ExecutionMode::INFERENCE);
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
@@ -1076,8 +1488,8 @@ NeuralNetwork::inference(unsigned int batch_size,
   input_tensors.reserve(input.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
-    input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+    input_tensors.emplace_back(
+      MAKE_SHARED_TENSOR(mapExternalTensor(input[idx], in_dim[idx])));
   }
 
   if (!label.empty()) {
@@ -1086,9 +1498,8 @@ NeuralNetwork::inference(unsigned int batch_size,
     label_tensors.reserve(label.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
-      label_tensors.emplace_back(MAKE_SHARED_TENSOR(
-        Tensor::Map(label[idx], label_dim[idx].getDataLen() * sizeof(float),
-                    label_dim[idx], 0)));
+      label_tensors.emplace_back(
+        MAKE_SHARED_TENSOR(mapExternalTensor(label[idx], label_dim[idx])));
     }
     output_tensors = inference(input_tensors, label_tensors, false);
   } else {
@@ -1156,8 +1567,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   input_tensors.reserve(input.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
-    input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+    input_tensors.emplace_back(
+      MAKE_SHARED_TENSOR(mapExternalTensor(input[idx], in_dim[idx])));
   }
 
   // auto start_increment = std::chrono::high_resolution_clock::now();
@@ -1167,9 +1578,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     label_tensors.reserve(label.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
-      label_tensors.emplace_back(MAKE_SHARED_TENSOR(
-        Tensor::Map(label[idx], label_dim[idx].getDataLen() * sizeof(float),
-                    label_dim[idx], 0)));
+      label_tensors.emplace_back(
+        MAKE_SHARED_TENSOR(mapExternalTensor(label[idx], label_dim[idx])));
     }
     output_tensors = incremental_inference(input_tensors, label_tensors,
                                            init_seq_len, from, to);
@@ -1195,8 +1605,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-      nntrainer::scopy(buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data,
-                       1);
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif

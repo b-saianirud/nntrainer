@@ -26,8 +26,8 @@
 #include <cmath>
 #include <gpt_oss_moe_layer.h>
 #include <node_exporter.h>
-#include <omp.h>
 #include <stdexcept>
+#include <thread_manager.h>
 
 namespace causallm {
 
@@ -215,11 +215,15 @@ void GptOssMoELayer::forwarding(nntrainer::RunLayerContext &context,
   auto topk_indices = std::get<1>(topk_result);
 
   const uint32_t *indices_data = topk_indices.getData<uint32_t>();
-#pragma omp parallel for collapse(2)
-  for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
-    for (int k = 0; k < static_cast<int>(topk); ++k) {
-      expert_mask.setValue(indices_data[i * topk + k], 0, k, i, 1.0f);
-    }
+  {
+    auto &tm = nntrainer::ThreadManager::Global();
+    size_t total_iters =
+      static_cast<size_t>(total_tokens) * static_cast<size_t>(topk);
+    tm.parallel_for(0, static_cast<size_t>(total_iters), [&](size_t idx) {
+      int k = idx % topk;
+      int i = idx / topk;
+      expert_mask.setValue(indices_data[idx], 0, k, i, 1.0f);
+    });
   }
 
   // Pre-compute expert token assignments for better cache locality
@@ -233,54 +237,22 @@ void GptOssMoELayer::forwarding(nntrainer::RunLayerContext &context,
     }
   }
 
-  // Adaptive optimization based on workload
-  const int active_experts =
-    std::count_if(expert_assignments.begin(), expert_assignments.end(),
-                  [](const auto &assignments) { return !assignments.empty(); });
+  // Serial outer loop: the expert GEMV/GEMM parallelizes internally via
+  // ThreadManager (dot() calls parallel_for), and nesting parallel_for
+  // deadlocks because ThreadManager::parallelize() uses a non-recursive
+  // execution_mutex_.
+  for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
+       ++expert_idx) {
+    const auto &assignments = expert_assignments[expert_idx];
+    if (assignments.empty())
+      continue;
 
-  // Calculate total work (sum of token assignments across all experts)
-  int total_work = 0;
-  for (const auto &assignments : expert_assignments) {
-    total_work += assignments.size();
-  }
-
-  // Use parallel processing only when it's beneficial
-  const bool use_parallel = (total_work > 4) && (active_experts > 1);
-
-  if (use_parallel) {
-    // Parallel processing for larger workloads
-#pragma omp parallel
-    {
-#pragma omp for schedule(dynamic)
-      for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-           ++expert_idx) {
-        const auto &assignments = expert_assignments[expert_idx];
-        if (assignments.empty())
-          continue;
-
-        // Use optimized expert forward computation without memory copies
-        compute_expert_forward(
-          input, output, assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-      }
-    }
-  } else {
-    // Sequential processing for smaller workloads
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
-
-      // Use optimized expert forward computation without memory copies
-      compute_expert_forward(
-        input, output, assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    }
+    // Use optimized expert forward computation without memory copies
+    compute_expert_forward(
+      input, output, assignments,
+      context.getWeight(expert_gate_proj_indices[expert_idx]),
+      context.getWeight(expert_up_proj_indices[expert_idx]),
+      context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
   }
 
   // reshape output: [B*S,1,1,H] -> [B,1,S,H]
@@ -425,17 +397,21 @@ inline void GptOssMoELayer::compute_expert_forward_no_critical(
     // Y := gate_out
     // Z := up_out + 1
     up_out.add_i(1);
-#pragma omp parallel for collapse(3)
-    for (unsigned int b = 0; b < acti_out.batch(); ++b) {
-      for (unsigned int c = 0; c < acti_out.channel(); ++c) {
-        for (unsigned int h = 0; h < acti_out.height(); ++h) {
-          nntrainer::swiglu(
-            acti_out.width(),
-            acti_out.getData<float>() + acti_out.getIndex(b, c, h, 0),
-            gate_out.getData<float>() + gate_out.getIndex(b, c, h, 0),
-            up_out.getData<float>() + up_out.getIndex(b, c, h, 0), alpha);
-        }
-      }
+    {
+      size_t total_iters = static_cast<size_t>(acti_out.batch()) *
+                           static_cast<size_t>(acti_out.channel()) *
+                           static_cast<size_t>(acti_out.height());
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, total_iters, [&](size_t idx) {
+        unsigned int h = idx % acti_out.height();
+        unsigned int c = (idx / acti_out.height()) % acti_out.channel();
+        unsigned int b = idx / (acti_out.height() * acti_out.channel());
+        nntrainer::swiglu(
+          acti_out.width(),
+          acti_out.getData<float>() + acti_out.getIndex(b, c, h, 0),
+          gate_out.getData<float>() + gate_out.getIndex(b, c, h, 0),
+          up_out.getData<float>() + up_out.getIndex(b, c, h, 0), alpha);
+      });
     }
 
     // Down projection using optimized dot operation
@@ -500,7 +476,7 @@ void GptOssMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
     input.dot(gate_weights, router_logits);
-    nntrainer::Tensor gate_bias = context.getWeight(gate_bias_idx);
+    nntrainer::Tensor &gate_bias = context.getWeight(gate_bias_idx);
     router_logits.add_i(gate_bias);
 
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);

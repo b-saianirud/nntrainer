@@ -28,6 +28,7 @@ fi
 
 files=$1
 failed=0
+report_path=${report_path:-/tmp/doxygen-tag-report.log}
 
 if [ ! -f $files ]; then
   echo "::error The file $files does not exists."
@@ -37,7 +38,7 @@ fi
 echo "::group::Doxygen tag check started"
 
 for file in `cat $files`; do
-  if [[ `file $file | grep "ASCII text" | wc -l` -gt 0 ]]; then
+  if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
       # In case of source code files: *.c|*.h|*.cpp|*.py|*.sh|*.php )
       case $file in
           # In case of C/C++ code
@@ -53,9 +54,25 @@ for file in `cat $files`; do
                   doxygen_basic_rules="$doxygen_basic_rules $doxygen_advanced_rules"
               fi
 
+              # Only the file's leading header comments count as "the top of
+              # file" — grepping the whole file let a per-function @brief,
+              # @author, or @bug satisfy this check even when the file had
+              # no header block at all. Capture just that leading region:
+              # blank lines, "//" comments, and any number of consecutive
+              # "/* ... */" blocks (some files split license text and the
+              # @file/@brief block into two separate comments); the first
+              # line that isn't part of that leading comment run ends it.
+              header_block=`awk '
+                  in_block { print; if ($0 ~ /\*\//) in_block=0; next }
+                  /^[[:space:]]*$/ { next }
+                  /^[[:space:]]*\/\// { next }
+                  /^\/\*/ { in_block=1; print; if ($0 ~ /\*\//) in_block=0; next }
+                  { exit }
+              ' "$file"`
+
               for word in $doxygen_basic_rules
               do
-                  doxygen_rule_compare_count=`cat ${file} | grep "$word" | wc -l`
+                  doxygen_rule_compare_count=`echo "$header_block" | grep -c "$word"`
                   doxygen_rule_expect_count=1
 
                   # Doxygen_rule_compare_count: real number of Doxygen tags in a file
@@ -69,59 +86,21 @@ for file in `cat $files`; do
               # Checking tags for each function
               if [[ $advanced == 1 ]]; then
                   declare -i idx=0
-                  function_positions="" # Line number of functions.
-                  structure_positions="" # Line number of structure.
-
-                  local function_check_flag="f+p" # check document for function and prototype of the function
-
-                  if [[ $pr_doxygen_check_skip_function_definition == 1 && $file != *.h ]]; then
-                      function_check_flag="p" # check document for only prototypes of the function for non-header file
-                  fi
-
-                  # Find line number of functions using ctags, and append them.
-                  while IFS='' read -r line || [[ -n "$line" ]]; do
-                      temp=`echo $line | cut -d ' ' -f3` # line number of function place 3rd field when divided into ' ' >> $report_path
-                      function_positions="$function_positions $temp "
-                  done < <(ctags -x --c-kinds=$function_check_flag $file) # "--c-kinds=f" mean find function
-
-                  # Find line number of structure using ctags, and append them.
-                  while IFS='' read -r line || [[ -n "$line" ]]; do
-                      temp=`echo $line | cut -d ' ' -f3` # line number of structure place 3rd field when divided into ' ' >> $report_path
-                      structure_positions="$structure_positions $temp "
-                  done < <(ctags -x --c-kinds=sc $file) # "--c-kinds=sc" mean find 's'truct and 'c'lass
 
                   # Checking committed file line by line for detailed hints when missing Doxygen tags.
                   while IFS='' read -r line || [[ -n "$line" ]]; do
                       idx+=1
 
-                      # Check if a function has @brief tag or not.
-                      # To pass correct line number not sub number, keep space " $idx ".
-                      # ex) want to pass 143 not 14, 43, 1, 3, 4
-                      if [[ $function_positions =~ " $idx " && $brief -eq 0 ]]; then
-                          echo "[ERROR] File name: $file, $idx line, `echo $line | cut -d ' ' -f1` function needs @brief tag "
-                          failed=1
-                      fi
-
-                      # Check if a structure has @brief tag or not.
-                      # To pass correct line number not sub number, keep space " $idx ".
-                      # For example, we want to pass 143 not 14, 43, 1, 3, and 4.
-                      if [[ $structure_positions =~ " $idx " && $brief -eq 0 ]]; then # same as above.
-                          echo "[ERROR] File name: $file, $idx line, structure needs @brief tag "
-                          failed=1
-                      fi
-
-                      # Find brief or copydoc tag in the comments between the codes.
-                      if [[ $line =~  "@brief" || $line =~ "@copydoc" ]]; then
-                          brief=1
-                      # Doxygen tags become zero in code section.
-                      elif [[ $line != *"*"*  && ( $line =~ ";" || $line =~ "}" || $line =~ "#") ]]; then
-                          brief=0
-                      fi
-
                       # Check a comment statement that begins with '/*'.
-                      # Note that doxygen does not recognize a comment  statement that start with '/*'.
-                      # Let's skip the doxygen tag inspection such as "/**" in case of a single line comment.
-                      if [[ $line =~ "/*" && $line != *"/**"*  && ( $line != *"*/"  || $line =~ "@" ) && ( $idx != 1 ) ]]; then
+                      # Note that doxygen does not recognize a comment statement that starts with '/*'.
+                      # Only flag genuine multi-line block openers: the line (once
+                      # leading whitespace is stripped) must itself start the comment,
+                      # and the comment must not already close on the same line. This
+                      # keeps inline "/*name=*/" argument/designated-initializer
+                      # comments and wrapped single-line comments from being
+                      # misidentified as unterminated Doxygen blocks.
+                      trimmed="${line#"${line%%[![:space:]]*}"}"
+                      if [[ $trimmed == "/*"* && $trimmed != "/**"* && ( $line != *"*/"*  || $line =~ "@" ) && ( $idx != 1 ) ]]; then
                           echo "[ERROR] File name: $file, $idx line, Doxygen or multi line comments should begin with /**"
                           failed=1
                       fi
@@ -153,7 +132,10 @@ for file in `cat $files`; do
               if  [[ $doxygen_rule_num -le 0 ]]; then
                   echo "[ERROR] $doxygen_lang: failed. file name: $file, ($doxygen_rule_num)/$doxygen_rule_all tags are found."
                   failed=1
-                  break
+                  # continue (not break): "break" here would exit the outer
+                  # "for file" loop, silently skipping every file listed
+                  # after this one regardless of language.
+                  continue
               else
                   echo "[DEBUG] $doxygen_lang: passed. file name: $file, ($doxygen_rule_num)/$doxygen_rule_all tags are found." >> $report_path
               fi

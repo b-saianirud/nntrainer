@@ -376,10 +376,12 @@ void BatchNormalizationLayer::setBatch(RunLayerContext &context,
   }
 }
 
-void BatchNormalizationLayer::save(
-  std::ofstream &file, RunLayerContext &run_context, bool opt_var,
-  ml::train::ExecutionMode mode, bool trainable,
-  TensorDim::DataType definedWeightDataType) const {
+void BatchNormalizationLayer::save(std::ofstream &file,
+                                   RunLayerContext &run_context, bool opt_var,
+                                   ml::train::ExecutionMode mode,
+                                   bool trainable,
+                                   TensorDim::DataType definedWeightDataType,
+                                   ml::train::ISA target_isa) const {
   if (opt_var) {
     for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
       if (run_context.isGradientFirstAccess(i) && trainable) {
@@ -470,7 +472,7 @@ void BatchNormalizationLayer::read(ReadSource src, RunLayerContext &run_context,
                                    bool trainable,
                                    TensorDim::DataType definedWeightDataType,
                                    bool fsu, size_t start_offset,
-                                   bool read_from_offset) {
+                                   bool read_from_offset, int file_fd) {
   if (opt_var) {
     for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
       if (run_context.isGradientLastAccess(i) && trainable) {

@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
@@ -11,24 +15,42 @@ jobs:
       matrix:
         os: [ windows-2022, windows-2025 ]
 
-    name: Windows Meson build & test 
+    name: Windows Meson build & test
     steps:
       - name: Check out
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: -${{ github.event.pull_request.commits }}
+          fetch-depth: 0
+      # The composite check-rebuild action is sh-only, so reuse the same
+      # classifier script inline via bash (git-bash) to skip doc-only PRs.
+      - name: Check if rebuild required
+        id: rebuild
+        shell: bash
+        run: |
+          tmpfile=$(mktemp)
+          git show --pretty="format:" --name-only --diff-filter=AMRC ${{ github.event.pull_request.head.sha }} -${{ github.event.pull_request.commits }} | sort | uniq | awk NF > "$tmpfile"
+          if bash .github/actions/check-rebuild/check_if_rebuild_requires.sh "$tmpfile" build | grep -q "REBUILD=YES"; then
+            echo "rebuild=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuild=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install submodules
+        if: steps.rebuild.outputs.rebuild == '1'
         run: git submodule sync && git submodule update --init --recursive
       - name: Install Python Dependencies
+        if: steps.rebuild.outputs.rebuild == '1'
         run: pip install meson==1.7.2 ninja
       - name: Prepare MSVC
+        if: steps.rebuild.outputs.rebuild == '1'
         uses: bus1/cabuild/action/msdevshell@v1
         with:
           architecture: x64
       - name: Prepare Build
+        if: steps.rebuild.outputs.rebuild == '1'
         run: meson setup --native-file configurations/windows-native.ini builddir
       - name: Run Build
+        if: steps.rebuild.outputs.rebuild == '1'
         run: meson compile -C builddir
       - name: Run Test Suite
-        run: meson test -C builddir
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: meson test -C builddir --print-errorlogs

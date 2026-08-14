@@ -11,8 +11,8 @@
  * @note   This layer only supports inference mode.
  */
 
-#ifndef __RMS_NORM_LAYER_H__
-#define __RMS_NORM_LAYER_H__
+#ifndef __RESHAPED_RMS_NORM_LAYER_H__
+#define __RESHAPED_RMS_NORM_LAYER_H__
 
 #pragma once
 #ifdef _WIN32
@@ -47,8 +47,10 @@ public:
   WIN_EXPORT ReshapedRMSNormLayer() :
     Layer(),
     rms_props(props::RMS_NORM_GAMMA_INIT(), nntrainer::props::Epsilon(),
-              props::FeatureSize()),
-    feature_size(0) {
+              props::FeatureSize(), nntrainer::props::SkipPrefill(),
+              props::UseGamma()),
+    feature_size(0),
+    use_gamma(true) {
     wt_idx.fill(std::numeric_limits<unsigned int>::max());
   }
 
@@ -120,12 +122,14 @@ public:
 private:
   std::array<unsigned int, 1> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
-             props::FeatureSize>
+             props::FeatureSize, nntrainer::props::SkipPrefill, props::UseGamma>
     rms_props;
 
   unsigned int feature_size;
+  bool skip_prefill = false;
+  bool use_gamma;
 };
 
 } // namespace causallm
 
-#endif /* __CAUSALLM_RMS_NORM_LAYER_H__ */
+#endif /* __RESHAPED_RMS_NORM_LAYER_H__ */

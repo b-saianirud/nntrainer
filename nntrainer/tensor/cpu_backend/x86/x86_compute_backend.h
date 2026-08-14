@@ -15,6 +15,8 @@
 #define __x86_COMPUTE_BACKEND_H__
 #ifdef __cplusplus
 
+#include <cfloat>
+#include <common.h>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -391,97 +393,9 @@ void inv_sqrt_inplace(const unsigned int N, _FP16 *X);
 void transpose_matrix(const unsigned int M, const unsigned int N,
                       const _FP16 *src, unsigned int ld_src, _FP16 *dst,
                       unsigned int ld_dst);
-/**
- * @brief qs4cx quantization of (n*k) matrix. Typically a weight quantization,
- * and generally regard the weight is already transposed, and quantize it as it
- * is. qs4cx refers to quantized symmetric 4-bit quantization of channelwise x
- * groups.
- *
- * @param n N length of the matrix
- * @param k K length of the matrix
- * @param rhs_native_mtx_f32 matrix data before quantization to load
- * @param rhs_native_mtx_qs4cx matrix data after quantization to stroe
- * @param rhs_scales_f32 matrix quant scale after quantization to stroe
- * @param transB
- */
-void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
-                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
-                          bool transB = true);
 
-/**
- * @brief get size of memory to allocate for rhs weight packing of qsi4cxp to
- * qs4cxs1s0
- *
- * @param n row length if not transposed
- * @param k col length if not transposed
- * @return size_t size of memory to allocate
- */
-size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
-                                                  uint32_t idx_variant,
-                                                  bool transB);
-/**
- * @brief rhs matrix packing for qsi4cxp format
- *
- * @param n row length if not transposed
- * @param k col length if not transposed
- * @param rhs_packed_mtx_qs4cx dst* to store results
- * @param rhs_native_mtx_qs4cx input matrix data
- * @param rhs_scales_f32 input qparam data
- * @param transB rather the matrix is transposed or not
- */
-void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
-                                     void *rhs_packed_mtx_qs4cx,
-                                     void *rhs_native_mtx_qs4cx,
-                                     void *rhs_scales_f32, uint32_t idx_variant,
-                                     bool transB);
-/**
- * @brief GEMM of qai8dxp runtime-quantized activation and offline qs4cx
- * quantized weight
- *
- * @tparam T dataType of input activation and output matrices
- * @param m M length of the matrix
- * @param n N length of the matrix
- * @param k K length of the matrix
- * @param lhs_native_mtx activation (not quantized)
- * @param rhs_native_mtx_qs4cx offline quantized weight
- * @param rhs_scales scale factor vector of quantized weight
- * @param dst_mtx dst matrix
- * @param lower_bound lower bound to clamp
- * @param upper_bound upper bound to clamp
- * @param transB Choose weight data to be transposed or not. Default value
- * regards the weight to be transpoed.
- */
-template <typename T = float>
-uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx,
-  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
-  T lower_bound = std::numeric_limits<T>::lowest(),
-  T upper_bound = std::numeric_limits<T>::max());
-
-/**
- * @brief run qai8dxp_qsi4cxp GEMM with offline weight packing
- *
- * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param lhs_native_mtx_f32 activation
- * @param rhs_packed_mtx_qs4cx qs4cx quantized weight, packed already
- * @param dst_act_mtx_f32 dst data
- * @param transB rather the weight matrix is transposed or not
- * @param lower_bound clipping param
- * @param upper_bound clipping param
- */
-template <typename T = float>
-void nntr_gemm_qai8dxp_qsi4cxp_packed(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
-  bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
-  T upper_bound = std::numeric_limits<T>::max());
 #endif
-/**
- * @brief Initialization of ggml backend
- */
-void init_backend();
+// init_backend() is declared in compute_ops.h (canonical location).
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h
@@ -924,9 +838,9 @@ bool is_valid(const unsigned int N, const float *X);
  * @param M Original row size of output
  * @param N Original col size of output
  * @param K Hidden size
- * @param A Input activation to be online-runtime quantized to q8_K_MxN format
+ * @param A Input activation to be online-runtime quantized to q8_0 format
  * @param lda Leading dimension of A
- * @param B (void*) (block_q4_K*) for Offline-quantized transposed weight
+ * @param B Offline-quantized transposed weight in block_q4_0x8
  * @param ldb Leading dimenstion of B
  * @param C T* output
  * @param ldc Leading dimension of C
@@ -1095,16 +1009,24 @@ template <typename T = float>
 void quantize_row_q8_K(const T *src, void *dst, int64_t k);
 
 /**
- * @brief repack q40 to q40x8
+ * @brief repack q40 to q40x8 or q40x4 depending on target ISA
+ *
+ * @details This function enables cross-platform quantization by allowing
+ * specification of target ISA format regardless of current platform.
+ * For example, quantizing on x86 but saving in ARM format.
  *
  * @param dst output repacked q40x8
  * @param src input q40
  * @param data_size total weight size
  * @param M number of rows
  * @param N number of columns
+ * @param target target ISA format (DEFAULT uses current backend, X86 forces
+ * x86 format, ARM forces ARM format)
  */
+
 void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
-                 const unsigned int N);
+                 const unsigned int N,
+                 ml::train::ISA target = ml::train::ISA::DEFAULT);
 
 /**
  * @brief repack q4K to q4Kx8
@@ -1331,6 +1253,240 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                        const uint16_t *osv32_scales,
                                        size_t scale_group_size,
                                        void *dst_q4_0x);
+
+/**
+ * kleidiai
+ */
+
+/**
+ * @brief qs4cx quantization of rhs matrix. Typically a weight quantization,
+ * and the weight must be transposed in (N, K).
+ * qs4cx refers to quantized symmetric 4-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for outputs before use:
+ *  - rhs_native_mtx_qs4cx
+ *    - is_nxk == true: n * ((k + 1) / 2)
+ *    - is_nxk == false: k * ((n + 1) / 2)
+ *  - rhs_scales_f32
+ *    n * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_f32 matrix data before quantization
+ * @param[out] rhs_native_mtx_qs4cx quantized matrix data after quantization
+ * @param[out] rhs_scales_f32 matrix quant scale after quantization
+ * @param[in] is_nxk true if the quantized matrix in stored in nxk format
+ */
+void quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
+                     bool is_nxk);
+
+/**
+ * @brief qs4cx dequantization of rhs matrix. Inverse of quant_qs4cx_f32.
+ * Converts quantized int4 back to float32 using per-channel scales.
+ * qs4cx refers to quantized symmetric 4-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    n * k * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized matrix data in float32
+ * @param[in] is_nxk true if the quantized matrix is stored in nxk format
+ */
+void dequant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs4cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32,
+                       bool is_nxk);
+
+/**
+ * @brief qs4cx dequantization of a single channel (row) in nxk format.
+ * Reads the n_idx-th row from the full nxk quantized buffers and converts it
+ * back to float32 using its per-channel scale. The result is written compactly
+ * to the first k floats of rhs_native_mtx_f32.
+ * qs4cx refers to quantized symmetric 4-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    k * sizeof(float)
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row (channel)
+ * @param[in] rhs_native_mtx_qs4cx full nxk quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized row data in float32 (k floats)
+ */
+void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32);
+
+/**
+ * @brief qs8cx quantization of rhs matrix in nxk format. Typically a weight
+ * quantization, and the weight must be transposed in (N, K).
+ * qs8cx refers to quantized symmetric 8-bit channel-wise quantization.
+ * Note that the output is stored as signed int8.
+ *
+ * @warning You should allocate memory for outputs before use:
+ *  - rhs_native_mtx_qs8cx
+ *    n * k * sizeof(int8_t)
+ *  - rhs_scales_f32
+ *    n * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_f32 matrix data before quantization
+ * @param[out] rhs_native_mtx_qs8cx quantized matrix data after quantization
+ * @param[out] rhs_scales_f32 matrix quant scale after quantization
+ */
+void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs8cx, void *rhs_scales_f32);
+
+/**
+ * @brief qs8cx dequantization of rhs matrix in nxk format. Inverse of
+ * quant_qs8cx_f32. Converts quantized int8 back to float32 using per-channel
+ * scales. qs8cx refers to quantized symmetric 8-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    n * k * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_qs8cx quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized matrix data in float32
+ */
+void dequant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs8cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32);
+
+/**
+ * @brief qs8cx dequantization of a single channel (row) in nxk format.
+ * Reads the n_idx-th row from the full nxk quantized buffers and converts it
+ * back to float32 using its per-channel scale. The result is written compactly
+ * to the first k floats of rhs_native_mtx_f32.
+ * qs8cx refers to quantized symmetric 8-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    k * sizeof(float)
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row (channel)
+ * @param[in] rhs_native_mtx_qs8cx full nxk quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized row data in float32 (k floats)
+ */
+void dequantize_row_qs8cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs8cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32);
+
+/**
+ * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
+ * qsi4cxp
+ * Note that nxk is the format of quantized rhs, not the shape of rhs
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ * @return size_t size of memory to allocate
+ */
+size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                             size_t idx_variant, bool is_nxk);
+
+/**
+ * @brief rhs matrix packing from nxk qs4cxs1s0 to qsi4cxp
+ * Note that rhs_qs4cx must be stored with UINT4 shape (zero point = 8)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[out] rhs_packed_mtx_qs4cx packed rhs
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ */
+void rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k, void *rhs_packed_mtx_qs4cx,
+                                void *rhs_native_mtx_qs4cx,
+                                void *rhs_scales_f32, size_t idx_variant,
+                                bool is_nxk);
+
+/**
+ * @brief run qai8dxp_qsi4cxp GEMM with online rhs packing
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  size_t idx_variant, bool is_nxk, float lower_bound = -FLT_MAX,
+  float upper_bound = FLT_MAX);
+
+/**
+ * @brief run qai8dxp_qsi4cxp GEMM with offline packed rhs
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_packed_mtx_qs4cx quantized matrix data, packed already
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                          void *lhs_native_mtx_f32, void *rhs_packed_mtx_qs4cx,
+                          float *dst_act_mtx_f32, size_t idx_variant,
+                          float lower_bound = -FLT_MAX,
+                          float upper_bound = FLT_MAX);
+
+/**
+ * @brief Causal depthwise Conv1D prefill for kernel size 3.
+ *
+ * Computes output[b, t, c] = w0[c] * x[b, t, c] +
+ *                            w1[c] * x[b, t - 1, c] +
+ *                            w2[c] * x[b, t - 2, c] + bias[c].
+ * Missing causal history for t < 2 is treated as zero.
+ *
+ * @param input input tensor in contiguous [B, H, W] order
+ * @param packed_weight packed weights [w0 | w1 | w2], each W floats
+ * @param bias optional bias, W floats, can be nullptr
+ * @param output output tensor in contiguous [B, H, W] order
+ * @param B batch size
+ * @param H sequence length
+ * @param W feature width / channel count
+ */
+void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
+                                const float *bias, float *output,
+                                unsigned int B, unsigned int H, unsigned int W);
+
+/**
+ * @brief Single-token decode step for causal depthwise Conv1D kernel size 3.
+ *
+ * Uses state[0..W-1] as x_{t-2} and state[W..2W-1] as x_{t-1},
+ * computes y_cur = w0*x_cur + w1*x_{t-1} + w2*x_{t-2}, then updates
+ * the state in-place to [x_{t-1} | x_t].
+ *
+ * @param x_cur current token features, W floats
+ * @param packed_weight packed weights [w0 | w1 | w2], each W floats
+ * @param state rolling causal state, 2 * W floats, updated in-place
+ * @param y_cur output for the current token, W floats
+ * @param W feature width / channel count
+ */
+void causal_depthwise_conv1d_k3_decode(const float *x_cur,
+                                       const float *packed_weight, float *state,
+                                       float *y_cur, unsigned int W);
 
 } /* namespace nntrainer */
 #endif /* __cplusplus */

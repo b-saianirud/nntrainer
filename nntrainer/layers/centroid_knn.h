@@ -3,6 +3,7 @@
  * Copyright (C) 2020 Jihoon Lee <jhoon.it.lee@samsung.com>
  *
  * @file   centroid_knn.h
+ * @brief  Centroid k-NN layer: computes the L2 distance to per-class centroids.
  * @date   09 Jan 2021
  * @details  This file contains the simple nearest neighbor layer, this layer
  * takes centroid and calculate l2 distance

@@ -2,7 +2,11 @@ name: "Build Test - Ubuntu Meson (clang)"
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   meson_test:
@@ -13,25 +17,39 @@ jobs:
         os: [ ubuntu-22.04, ubuntu-24.04 ]
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Check if rebuild required
+      uses: ./.github/actions/check-rebuild
     - name: Set up Python 3.10
+      if: env.rebuild == '1'
       uses: actions/setup-python@v5
       with:
         python-version: "3.10"
     - name: install additional package from PPA for testing
+      if: env.rebuild == '1'
       run: sudo add-apt-repository -y ppa:nnstreamer/ppa && sudo apt-get update
     - name: install minimal requirements
+      if: env.rebuild == '1'
       run: sudo apt-get update && sudo apt-get install -y libopenblas-dev libiniparser-dev libjsoncpp-dev libcurl3-dev tensorflow2-lite-dev nnstreamer-dev libglib2.0-dev libgstreamer1.0-dev libgtest-dev ml-api-common-dev flatbuffers-compiler ml-inference-api-dev libunwind-dev
     - name: install additional packages for features
+      if: env.rebuild == '1'
       run: sudo apt-get install -y python3-dev python3-numpy python3
     - name: Install llvm
-      run: sudo apt install -y llvm libomp-dev
+      if: env.rebuild == '1'
+      run: sudo apt install -y llvm
     - name: Install submodules
+      if: env.rebuild == '1'
       run: git submodule sync && git submodule update --init --recursive
     - name: Install build systems
+      if: env.rebuild == '1'
       run: sudo apt install meson ninja-build
     - name: Prepare Build
+      if: env.rebuild == '1'
       run: meson setup --native-file configurations/linux-native-clang.ini builddir
     - name: Run Build
+      if: env.rebuild == '1'
       run: meson compile -C builddir
     - name: Run Test Suite
-      run: meson test -C builddir
+      if: env.rebuild == '1'
+      run: meson test -C builddir --print-errorlogs

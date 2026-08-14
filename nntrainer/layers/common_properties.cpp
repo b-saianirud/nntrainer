@@ -42,7 +42,10 @@ void Name::set(const std::string &value) {
 }
 
 bool Name::isValid(const std::string &v) const {
-  static std::regex allowed("[a-zA-Z0-9][-_./a-zA-Z0-9]*");
+  // Leading '_' is allowed: ONNX-exported QNN graphs name tensors like
+  // "_model_embed_tokens_Gather_Gather_output_0" and layer names must match
+  // the graph tensor names exactly for input binding.
+  static std::regex allowed("[_a-zA-Z0-9][-_./a-zA-Z0-9]*");
   return !v.empty() && std::regex_match(v, allowed);
 }
 

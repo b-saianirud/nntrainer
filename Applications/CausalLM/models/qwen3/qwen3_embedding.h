@@ -3,6 +3,7 @@
  * Copyright (C) 2025 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file   qwen3_embedding.h
+ * @brief  Qwen3-based embedding model.
  * @date   07 Jan 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>

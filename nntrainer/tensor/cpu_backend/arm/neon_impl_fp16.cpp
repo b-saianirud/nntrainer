@@ -15,13 +15,13 @@
 #include <matrix_transpose_neon.h>
 #include <memory>
 #include <neon_impl.h>
-#include <neon_setting.h>
 #include <nntrainer_error.h>
 #ifdef ARMV7
 #include <armv7_neon.h>
 #endif
 
 #include <iostream>
+#include <thread_manager.h>
 
 namespace nntrainer::neon {
 bool is_valid(const unsigned int N, const __fp16 *input) {
@@ -326,11 +326,6 @@ void hgemv(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M, uint32_t N,
 
 void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
                      uint32_t N, float alpha, float beta) {
-#ifdef OMP_NUM_THREADS
-  set_gemv_num_threads(OMP_NUM_THREADS);
-#endif
-  size_t GEMV_NUM_THREADS = get_gemv_num_threads();
-
   float *Y32 = new float[N];
   unsigned int idx = 0;
   for (; N - idx >= 8; idx += 8) {
@@ -357,55 +352,58 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
     __fp16 x[16];
     vst1q_f16(&x[0], vmulq_n_f16(vld1q_f16(&X[i]), alpha));
     vst1q_f16(&x[8], vmulq_n_f16(vld1q_f16(&X[i + 8]), alpha));
-#pragma omp parallel for schedule(guided) num_threads(GEMV_NUM_THREADS)
-    for (unsigned int idx = 0; idx < N8; idx += 8) {
-      float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
+    {
+      auto &tm = ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(N8 / 8), [&](size_t _idx) {
+        size_t idx = _idx * 8;
+        float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
 
-      float16x8_t w2vec0_7_f16 =
-        vmulq_n_f16(vld1q_f16(&A[(i + 4) * N + idx]), x[4]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 5) * N + idx]), x[5]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 6) * N + idx]), x[6]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 7) * N + idx]), x[7]);
+        float16x8_t w2vec0_7_f16 =
+          vmulq_n_f16(vld1q_f16(&A[(i + 4) * N + idx]), x[4]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 5) * N + idx]), x[5]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 6) * N + idx]), x[6]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 7) * N + idx]), x[7]);
 
-      float16x8_t w3vec0_7_f16 =
-        vmulq_n_f16(vld1q_f16(&A[(i + 8) * N + idx]), x[8]);
-      w3vec0_7_f16 =
-        vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 9) * N + idx]), x[9]);
-      w3vec0_7_f16 =
-        vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 10) * N + idx]), x[10]);
-      w3vec0_7_f16 =
-        vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 11) * N + idx]), x[11]);
+        float16x8_t w3vec0_7_f16 =
+          vmulq_n_f16(vld1q_f16(&A[(i + 8) * N + idx]), x[8]);
+        w3vec0_7_f16 =
+          vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 9) * N + idx]), x[9]);
+        w3vec0_7_f16 =
+          vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 10) * N + idx]), x[10]);
+        w3vec0_7_f16 =
+          vfmaq_n_f16(w3vec0_7_f16, vld1q_f16(&A[(i + 11) * N + idx]), x[11]);
 
-      float16x8_t w4vec0_7_f16 =
-        vmulq_n_f16(vld1q_f16(&A[(i + 12) * N + idx]), x[12]);
-      w4vec0_7_f16 =
-        vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 13) * N + idx]), x[13]);
-      w4vec0_7_f16 =
-        vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 14) * N + idx]), x[14]);
-      w4vec0_7_f16 =
-        vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 15) * N + idx]), x[15]);
+        float16x8_t w4vec0_7_f16 =
+          vmulq_n_f16(vld1q_f16(&A[(i + 12) * N + idx]), x[12]);
+        w4vec0_7_f16 =
+          vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 13) * N + idx]), x[13]);
+        w4vec0_7_f16 =
+          vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 14) * N + idx]), x[14]);
+        w4vec0_7_f16 =
+          vfmaq_n_f16(w4vec0_7_f16, vld1q_f16(&A[(i + 15) * N + idx]), x[15]);
 
-      wvec0_7_f16 = vaddq_f16(wvec0_7_f16, w3vec0_7_f16);
-      w2vec0_7_f16 = vaddq_f16(w2vec0_7_f16, w4vec0_7_f16);
+        wvec0_7_f16 = vaddq_f16(wvec0_7_f16, w3vec0_7_f16);
+        w2vec0_7_f16 = vaddq_f16(w2vec0_7_f16, w4vec0_7_f16);
 
-      float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
-                                   vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
-      y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
-      float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
-                                   vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
-      y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
+        float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
+                                     vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
+        y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
+        float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
+                                     vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
+        y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
 
-      vst1q_f32(&Y32[idx], y0_3);
-      vst1q_f32(&Y32[idx + 4], y4_7);
+        vst1q_f32(&Y32[idx], y0_3);
+        vst1q_f32(&Y32[idx + 4], y4_7);
+      });
     }
 
     if (N != N8) {
@@ -487,41 +485,44 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
   for (; M - i >= 8; i += 8) {
     __fp16 x[8];
     vst1q_f16(&x[0], vmulq_n_f16(vld1q_f16(&X[i]), alpha));
-#pragma omp parallel for schedule(guided) num_threads(GEMV_NUM_THREADS)
-    for (unsigned int idx = 0; idx < N8; idx += 8) {
-      float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
+    {
+      auto &tm = ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(N8 / 8), [&](size_t _idx) {
+        size_t idx = _idx * 8;
+        float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
 
-      float16x8_t w2vec0_7_f16 =
-        vmulq_n_f16(vld1q_f16(&A[(i + 4) * N + idx]), x[4]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 5) * N + idx]), x[5]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 6) * N + idx]), x[6]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 7) * N + idx]), x[7]);
+        float16x8_t w2vec0_7_f16 =
+          vmulq_n_f16(vld1q_f16(&A[(i + 4) * N + idx]), x[4]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 5) * N + idx]), x[5]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 6) * N + idx]), x[6]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 7) * N + idx]), x[7]);
 
-      float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
-                                   vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
-      y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
-      float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
-                                   vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
-      y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
+        float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
+                                     vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
+        y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
+        float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
+                                     vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
+        y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
 
-      vst1q_f32(&Y32[idx], y0_3);
-      vst1q_f32(&Y32[idx + 4], y4_7);
+        vst1q_f32(&Y32[idx], y0_3);
+        vst1q_f32(&Y32[idx + 4], y4_7);
+      });
     }
 
     if (N != N8) {
@@ -575,32 +576,35 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
   for (; M - i >= 4; i += 4) {
     __fp16 x[4];
     vst1_f16(&x[0], vmul_n_f16(vld1_f16(&X[i]), alpha));
-#pragma omp parallel for schedule(guided) num_threads(GEMV_NUM_THREADS)
-    for (unsigned int idx = 0; idx < N8; idx += 8) {
-      float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
-      wvec0_7_f16 =
-        vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
-      float16x8_t w2vec0_7_f16 =
-        vmulq_n_f16(vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
-      w2vec0_7_f16 =
-        vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
+    {
+      auto &tm = ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(N8 / 8), [&](size_t _idx) {
+        size_t idx = _idx * 8;
+        float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x[0]);
+        wvec0_7_f16 =
+          vfmaq_n_f16(wvec0_7_f16, vld1q_f16(&A[(i + 1) * N + idx]), x[1]);
+        float16x8_t w2vec0_7_f16 =
+          vmulq_n_f16(vld1q_f16(&A[(i + 2) * N + idx]), x[2]);
+        w2vec0_7_f16 =
+          vfmaq_n_f16(w2vec0_7_f16, vld1q_f16(&A[(i + 3) * N + idx]), x[3]);
 
-      float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
-                                   vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
-      y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
-      float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
-                                   vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
-      y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
+        float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
+                                     vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
+        y0_3 = vaddq_f32(y0_3, vcvt_f32_f16(vget_low_f16(w2vec0_7_f16)));
+        float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
+                                     vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
+        y4_7 = vaddq_f32(y4_7, vcvt_f32_f16(vget_high_f16(w2vec0_7_f16)));
 
-      vst1q_f32(&Y32[idx], y0_3);
-      vst1q_f32(&Y32[idx + 4], y4_7);
+        vst1q_f32(&Y32[idx], y0_3);
+        vst1q_f32(&Y32[idx + 4], y4_7);
+      });
     }
     if (N != N8) {
       unsigned int idx = N8;
@@ -638,22 +642,25 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
   for (; i < M; ++i) {
     __fp16 x = alpha * (X[i]);
-#pragma omp parallel for schedule(guided) num_threads(GEMV_NUM_THREADS)
-    for (unsigned int idx = 0; idx < N8; idx += 8) {
-      float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x);
-      float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
-                                   vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
-      float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
-                                   vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
+    {
+      auto &tm = ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(N8 / 8), [&](size_t _idx) {
+        size_t idx = _idx * 8;
+        float16x8_t wvec0_7_f16 = vmulq_n_f16(vld1q_f16(&A[i * N + idx]), x);
+        float32x4_t y0_3 = vaddq_f32(vld1q_f32(&Y32[idx]),
+                                     vcvt_f32_f16(vget_low_f16(wvec0_7_f16)));
+        float32x4_t y4_7 = vaddq_f32(vld1q_f32(&Y32[idx + 4]),
+                                     vcvt_f32_f16(vget_high_f16(wvec0_7_f16)));
 
-      vst1q_f32(&Y32[idx], y0_3);
-      vst1q_f32(&Y32[idx + 4], y4_7);
+        vst1q_f32(&Y32[idx], y0_3);
+        vst1q_f32(&Y32[idx + 4], y4_7);
+      });
     }
     if (N != N8) {
       unsigned int idx = N8;
@@ -1307,18 +1314,23 @@ void swiglu(const unsigned int N, __fp16 *X, __fp16 *Y, __fp16 *Z) {
   for (; N - i >= 8; i += 8) {
     float16x8_t y0_7 = vld1q_f16(&Y[i]);
     float16x8_t z0_7 = vld1q_f16(&Z[i]);
-    float16x8_t y0_7_minus = vmulq_n_f16(y0_7, -1);
 
-    float32x4_t exp0_3 = exp_ps(vcvt_f32_f16(vget_low_f16(y0_7_minus)));
-    float32x4_t exp4_7 = exp_ps(vcvt_f32_f16(vget_high_f16(y0_7_minus)));
+    // Compute silu(Y) * Z entirely in FP32 and narrow to FP16 only on store.
+    // Doing the silu division and the * Z product in FP16 overflows fp16 max
+    // (65504) on large MLP intermediates -> Inf -> NaN downstream. The
+    // scalar tail below already computes in fp32; this matches it.
+    float32x4_t yl = vcvt_f32_f16(vget_low_f16(y0_7));
+    float32x4_t yh = vcvt_f32_f16(vget_high_f16(y0_7));
+    float32x4_t zl = vcvt_f32_f16(vget_low_f16(z0_7));
+    float32x4_t zh = vcvt_f32_f16(vget_high_f16(z0_7));
 
-    float16x8_t exp0_7 =
-      vcombine_f16(vcvt_f16_f32(exp0_3), vcvt_f16_f32(exp4_7));
-    exp0_7 = vaddq_f16(exp0_7, vmovq_n_f16(1.f));
-    exp0_7 = vdivq_f16(y0_7, exp0_7);
-    exp0_7 = vmulq_f16(exp0_7, z0_7);
+    float32x4_t one = vmovq_n_f32(1.f);
+    float32x4_t sl = vdivq_f32(yl, vaddq_f32(exp_ps(vnegq_f32(yl)), one));
+    float32x4_t sh = vdivq_f32(yh, vaddq_f32(exp_ps(vnegq_f32(yh)), one));
+    sl = vmulq_f32(sl, zl);
+    sh = vmulq_f32(sh, zh);
 
-    vst1q_f16(&X[i], exp0_7);
+    vst1q_f16(&X[i], vcombine_f16(vcvt_f16_f32(sl), vcvt_f16_f32(sh)));
   }
   while (i < N) {
     X[i] = (Y[i] / (1.f + std::exp(static_cast<float>(-Y[i])))) * Z[i];
@@ -1392,7 +1404,6 @@ inline static float16x8_t exp_f16x8(float16x8_t x) {
   float32x4_t res_high = exp_ps(x_high);
   return vcombine_f16(vcvt_f16_f32(res_low), vcvt_f16_f32(res_high));
 }
-
 
 // Static helper function for softmax_row_inplace with __fp16 sink
 // Includes handling of a "sink" token (attention sink)
@@ -2244,66 +2255,73 @@ static __fp16 hsumq_f16(float16x8_t v) {
   return vget_lane_f16(s1, 0);
 }
 
+// Native FP16-in / FP16-out RMS-norm-over-width.
+//
+// Sum-of-squares is accumulated in FP32 (two float32x4 vectors per 8-lane
+// load) instead of FP16: the residual stream of deep decoder layers can
+// reach magnitudes around 1e3, so squared accumulation across a 1024-wide
+// row would overflow FP16's 65504 ceiling. Scale derivation uses scalar
+// FP32 sqrt; the per-lane normalize multiply stays in FP16 with no
+// FP32<->FP16 conversion of the input/output buffers (the whole point of
+// having a native FP16 kernel here).
+template <>
+void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                       _FP16 *__restrict Y, size_t H, size_t W,
+                                       float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *rowX = X + h * W;
+    _FP16 *rowY = Y + h * W;
+
+    size_t i = 0;
+    float32x4_t acc0 = vdupq_n_f32(0.F);
+    float32x4_t acc1 = vdupq_n_f32(0.F);
+
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t h8 = vld1q_f16(rowX + i);
+      float32x4_t f0 = vcvt_f32_f16(vget_low_f16(h8));
+      float32x4_t f1 = vcvt_f32_f16(vget_high_f16(h8));
+      acc0 = vfmaq_f32(acc0, f0, f0);
+      acc1 = vfmaq_f32(acc1, f1, f1);
+    }
+    if (i + 4 <= W) {
+      float16x4_t h4 = vld1_f16(rowX + i);
+      float32x4_t f = vcvt_f32_f16(h4);
+      acc0 = vfmaq_f32(acc0, f, f);
+      i += 4;
+    }
+    float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < W; ++i) {
+      float x = (float)rowX[i];
+      sum += x * x;
+    }
+
+    float mean_single = sum / (float)W;
+    float scale_single = 1.F / std::sqrt(mean_single + epsilon);
+    float16x8_t scale_v = vdupq_n_f16((__fp16)scale_single);
+    float16x4_t scale_v4 = vdup_n_f16((__fp16)scale_single);
+
+    i = 0;
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t xh = vld1q_f16(rowX + i);
+      vst1q_f16(rowY + i, vmulq_f16(xh, scale_v));
+    }
+    if (i + 4 <= W) {
+      float16x4_t xh4 = vld1_f16(rowX + i);
+      vst1_f16(rowY + i, vmul_f16(xh4, scale_v4));
+      i += 4;
+    }
+    for (; i < W; ++i) {
+      rowY[i] = (__fp16)((float)rowX[i] * scale_single);
+    }
+  }
+}
+
 template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
-  const float eps_h = (float)epsilon;
-
-  for (size_t h = 0; h < H; ++h) {
-    const float *rowX = X + h * W;
-    float *rowY = Y + h * W;
-
-    size_t i = 0;
-    float16x8_t acc = vdupq_n_f16(0.F);
-
-    for (; i + 8 <= W; i += 8) {
-      float32x4_t f0 = vld1q_f32(rowX + i + 0);
-      float32x4_t f1 = vld1q_f32(rowX + i + 4);
-      float16x4_t h0 = vcvt_f16_f32(f0);
-      float16x4_t h1 = vcvt_f16_f32(f1);
-      float16x8_t h8 = vcombine_f16(h0, h1);
-      acc = vfmaq_f16(acc, h8, h8);
-    }
-
-    if (i + 4 <= W) {
-      float32x4_t f = vld1q_f32(rowX + i);
-      float16x4_t h4 = vcvt_f16_f32(f);
-      float16x4_t p4 = vmul_f16(h4, h4);
-      acc = vaddq_f16(acc, vcombine_f16(p4, vdup_n_f16(0.F)));
-      i += 4;
-    }
-
-    __fp16 sum_h = hsumq_f16(acc);
-    for (; i < W; ++i) {
-      float hx = (float)rowX[i];
-      sum_h = sum_h + hx * hx;
-    }
-
-    float mean_single = sum_h / W;
-    float scale_single = 1.F / std::sqrt(mean_single + eps_h);
-    float16x8_t scale_v = vdupq_n_f16(scale_single);
-
-    i = 0;
-    for (; i + 8 <= W; i += 8) {
-      float32x4_t f0 = vld1q_f32(rowX + i + 0);
-      float32x4_t f1 = vld1q_f32(rowX + i + 4);
-      float16x8_t xh = vcombine_f16(vcvt_f16_f32(f0), vcvt_f16_f32(f1));
-      float16x8_t yh = vmulq_f16(xh, scale_v);
-
-      vst1q_f32(rowY + i + 0, vcvt_f32_f16(vget_low_f16(yh)));
-      vst1q_f32(rowY + i + 4, vcvt_f32_f16(vget_high_f16(yh)));
-    }
-    if (i + 4 <= W) {
-      float32x4_t f = vld1q_f32(rowX + i);
-      float16x4_t y4 = vmul_f16(vcvt_f16_f32(f), vget_low_f16(scale_v));
-      vst1q_f32(rowY + i, vcvt_f32_f16(y4));
-      i += 4;
-    }
-    for (; i < W; ++i) {
-      rowY[i] = rowX[i] * scale_single;
-    }
-  }
+  throw std::runtime_error("ERROR : rms_norm_wrt_width_fp16_intrinsic(float *) "
+                           "is deprecated due to overflow in fp16");
 }
 
 static inline float16x8_t vbslq_f16_u16(uint16x8_t m, float16x8_t a,

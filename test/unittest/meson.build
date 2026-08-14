@@ -57,6 +57,7 @@ endif
 test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
+  ['unittest_compute_ops_dispatch', []],
   ['unittest_nntrainer_fallback', []],
   ['unittest_nntrainer_tensor_types', []],
   ['unittest_nntrainer_tensor_advanced', []],
@@ -74,7 +75,9 @@ test_target = [
   ['unittest_common_properties', []],
   ['unittest_nntrainer_tensor_pool', []],
   ['unittest_nntrainer_lr_scheduler', []],
-  ['unittest_nntrainer_save_with_dtype', []]
+  ['unittest_nntrainer_save_with_dtype', []],
+  ['unittest_safetensors_quantize', []],
+  ['unittest_thread_manager', []],
   #['unittest_nntrainer_task', []],
 ]
 
@@ -102,6 +105,11 @@ if get_option('enable-profile')
   endif
 endif
 
+if host_machine.cpu_family() == 'aarch64'
+  test_target += [['unittest_nntrainer_kleidiai', []]]
+  test_target += [['unittest_nntrainer_ggml_arm', []]]
+endif
+
 foreach target: test_target
   exe = executable(
     target[0],
@@ -118,6 +126,39 @@ foreach target: test_target
     suite: 'unittests'
   )
 endforeach
+
+# DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
+# this target is defined standalone to add that directory to its include path
+# (the shared loop above can't set per-target include dirs). Embedding avoids a
+# build-time data-file path that would not resolve when a cross-compiled binary
+# runs on a separate test runner.
+unittest_ddtree_exe = executable(
+  'unittest_ddtree',
+  'unittest_ddtree.cpp',
+  include_directories: include_directories('models', 'ddtree_golden'),
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_ddtree', unittest_ddtree_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ddtree')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+unittest_memory_pool_exe = executable(
+  'unittest_memory_pool',
+  'memory' / 'unittest_memory_pool.cpp',
+  include_directories: include_directories('models', 'memory'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_memory_pool', unittest_memory_pool_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_memory_pool')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
 
 unittest_inc = include_directories('.')
 

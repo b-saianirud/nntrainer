@@ -2,11 +2,22 @@ name: C++ Format Checker
 
 on: pull_request
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cpp-linter:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check whitespace errors on changed lines
+        run: |
+          echo "Checking whitespace errors on changed lines"
+          git diff --check ${{ github.event.pull_request.base.sha }}...HEAD \
+            -- . ':(exclude).github' ':(exclude)Applications/CausalLM/third_party'
       - name: install dev packages
         run: |
           echo "Install mandatory dev packages to avoid false-positive reports from cpp-linter"
@@ -24,6 +35,9 @@ jobs:
           step-summary: true
           format-review: true
           tidy-checks: '-*' # disable clang-tidy checks.
+          # third_party/ holds vendored upstream code (minja, ...) that is not
+          # formatted to nntrainer style; skip it like static.check.yml does.
+          ignore: '.github|Applications/CausalLM/third_party'
 
       - name: failing fast
         if: steps.linter.outputs.clang-format-checks-failed > 0
