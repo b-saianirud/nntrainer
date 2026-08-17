@@ -15,12 +15,97 @@
 #include <dataset.h>
 #include <model.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
+
 namespace {
+
+/**
+ * @brief Read a thermal zone temperature from /sys/class/thermal.
+ * @param zone_index thermal zone index (default 0 = usually CPU/GPU)
+ * @return temperature in millidegrees Celsius, or -1 on failure
+ */
+int readThermalZone(int zone_index = 0) {
+  std::string path = "/sys/class/thermal/thermal_zone" +
+                     std::to_string(zone_index) + "/temp";
+  std::ifstream f(path);
+  if (!f.is_open())
+    return -1;
+  int temp;
+  f >> temp;
+  return temp;
+}
+
+/**
+ * @brief Find the thermal zone whose type contains "cpu" or "gpu".
+ * Scans /sys/class/thermal/thermal_zoneN/type for a match and returns
+ * the first matching zone index. Falls back to zone 0.
+ */
+int findCpuThermalZone() {
+  for (int i = 0; i < 16; ++i) {
+    std::string type_path = "/sys/class/thermal/thermal_zone" +
+                            std::to_string(i) + "/type";
+    std::ifstream f(type_path);
+    if (!f.is_open())
+      continue;
+    std::string type;
+    std::getline(f, type);
+    // Match common type names: "cpu", "cpu-0-0", "soc", "gpu", etc.
+    if (type.find("cpu") != std::string::npos ||
+        type.find("CPU") != std::string::npos ||
+        type.find("gpu") != std::string::npos ||
+        type.find("GPU") != std::string::npos)
+      return i;
+  }
+  return 0;
+}
+
+/**
+ * @brief Read current process RSS memory from /proc/self/status (Linux/Android).
+ * @return RSS in kilobytes, or -1 on failure.
+ */
+long readMemoryUsageKB() {
+  std::ifstream f("/proc/self/status");
+  if (!f.is_open())
+    return -1;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.compare(0, 6, "VmRSS:") == 0) {
+      // Format: "VmRSS:    12345 kB"
+      long kb = -1;
+      std::sscanf(line.c_str(), "VmRSS: %ld kB", &kb);
+      return kb;
+    }
+  }
+  return -1;
+}
+
+/**
+ * @brief Read total system memory from /proc/meminfo (Linux/Android).
+ * @return total system memory in kilobytes, or -1 on failure.
+ */
+long readTotalMemoryKB() {
+  std::ifstream f("/proc/meminfo");
+  if (!f.is_open())
+    return -1;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.compare(0, 9, "MemTotal:") == 0) {
+      long kb = -1;
+      std::sscanf(line.c_str(), "MemTotal: %ld kB", &kb);
+      return kb;
+    }
+  }
+  return -1;
+}
+
+
+
 
 void printUsage(const char *prog) {
   std::cout
@@ -61,17 +146,55 @@ struct EpochState {
   std::string q4_output_path; // empty unless --lora_weight_q4 was passed
   unsigned int epoch = 0;
   float best_loss = std::numeric_limits<float>::max();
+  int thermal_zone = 0;
+  long total_mem_kb = -1;
+  std::chrono::steady_clock::time_point train_start;
+  std::chrono::steady_clock::time_point epoch_start;
 };
 
 void onEpochComplete(void *user_data) {
   auto *st = static_cast<EpochState *>(user_data);
   ++st->epoch;
 
+  auto now = std::chrono::steady_clock::now();
+  auto epoch_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                          now - st->epoch_start)
+                          .count();
+  auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                          now - st->train_start)
+                          .count();
+
   auto train_stats = st->model->getTrainingStats();
   auto valid_stats = st->model->getValidStats();
 
-  std::cout << "[epoch " << st->epoch << "] train_loss=" << train_stats.loss
-            << " valid_loss=" << valid_stats.loss << std::endl;
+  // Read temperature once for this epoch
+  int temp_mc = readThermalZone(st->thermal_zone);
+  float temp_c = (temp_mc >= 0) ? (temp_mc / 1000.0f) : -1.0f;
+
+  // Read memory usage
+  long rss_kb = readMemoryUsageKB();
+  float rss_mb = (rss_kb >= 0) ? (rss_kb / 1024.0f) : -1.0f;
+  float mem_pct = -1.0f;
+  if (rss_kb >= 0 && st->total_mem_kb > 0)
+    mem_pct = (static_cast<float>(rss_kb) / st->total_mem_kb) * 100.0f;
+
+  // Print neatly formatted epoch summary
+  std::cout << "\n========================================" << std::endl;
+  std::cout << "  Epoch " << st->epoch << " Summary" << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "  train_loss:    " << train_stats.loss << std::endl;
+  std::cout << "  valid_loss:    " << valid_stats.loss << std::endl;
+  std::cout << "  time (epoch):  " << epoch_duration << " s" << std::endl;
+  std::cout << "  time (total):  " << total_duration << " s" << std::endl;
+  if (temp_c >= 0)
+    std::cout << "  temperature:   " << temp_c << " C" << std::endl;
+  if (rss_mb >= 0) {
+    std::cout << "  memory (RSS):  " << rss_mb << " MB";
+    if (mem_pct >= 0)
+      std::cout << " (" << mem_pct << "% of system)";
+    std::cout << std::endl;
+  }
+  std::cout << "========================================" << std::endl;
 
   // Save whenever validation loss improves, so an interrupted run still
   // leaves the best adapter on disk.
@@ -94,7 +217,11 @@ void onEpochComplete(void *user_data) {
       }
     }
   }
+
+  // Reset epoch start time for next epoch
+  st->epoch_start = std::chrono::steady_clock::now();
 }
+
 
 } // namespace
 
@@ -294,15 +421,71 @@ int main(int argc, char *argv[]) {
     model.setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset);
     model.setDataset(ml::train::DatasetModeType::MODE_VALID, dataset);
 
-    EpochState state{&model, output_path, q4_output_path};
+    // Set up per-epoch monitoring state
+    int thermal_zone = findCpuThermalZone();
+    long total_mem = readTotalMemoryKB();
+
+    std::cout << "\n----------------------------------------" << std::endl;
+    std::cout << "  System Info" << std::endl;
+    std::cout << "----------------------------------------" << std::endl;
+    if (total_mem > 0)
+      std::cout << "  total memory:  " << (total_mem / 1024.0f) << " MB"
+                << std::endl;
+    int pre_temp = readThermalZone(thermal_zone);
+    if (pre_temp >= 0)
+      std::cout << "  pre-train temp:" << (pre_temp / 1000.0f) << " C"
+                << std::endl;
+    long pre_rss = readMemoryUsageKB();
+    if (pre_rss > 0)
+      std::cout << "  pre-train RSS: " << (pre_rss / 1024.0f) << " MB"
+                << std::endl;
+    std::cout << "----------------------------------------\n" << std::endl;
+
+    auto train_start = std::chrono::steady_clock::now();
+
+    EpochState state;
+    state.model = &model;
+    state.output_path = output_path;
+    state.q4_output_path = q4_output_path;
+    state.thermal_zone = thermal_zone;
+    state.total_mem_kb = total_mem;
+    state.train_start = train_start;
+    state.epoch_start = train_start;
+
     model.train(onEpochComplete, &state);
 
-    std::cout << "training complete; best valid_loss=" << state.best_loss
-              << ", adapter at " << output_path << std::endl;
+    auto train_end = std::chrono::steady_clock::now();
+    auto total_train_time = std::chrono::duration_cast<std::chrono::seconds>(
+                              train_end - train_start)
+                              .count();
+
+    // Print final summary
+    int final_temp = readThermalZone(thermal_zone);
+    long final_rss = readMemoryUsageKB();
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "  Training Complete" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  best valid_loss: " << state.best_loss << std::endl;
+    std::cout << "  total time:      " << total_train_time << " s" << std::endl;
+    if (final_temp >= 0)
+      std::cout << "  final temp:      " << (final_temp / 1000.0f) << " C"
+                << std::endl;
+    if (final_rss > 0) {
+      std::cout << "  final RSS:       " << (final_rss / 1024.0f) << " MB";
+      if (total_mem > 0)
+        std::cout << " (" << (static_cast<float>(final_rss) / total_mem * 100.0f)
+                  << "% of system)";
+      std::cout << std::endl;
+    }
+    std::cout << "  adapter:         " << output_path << std::endl;
+    std::cout << "========================================" << std::endl;
+
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return EXIT_FAILURE;
   }
+
 
   return EXIT_SUCCESS;
 }

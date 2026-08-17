@@ -33,6 +33,18 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/layers \
+    $(NNTRAINER_ROOT)/nntrainer \
+    $(NNTRAINER_ROOT)/nntrainer/utils \
+    $(NNTRAINER_ROOT)/nntrainer/tensor \
+    $(NNTRAINER_ROOT)/nntrainer/graph \
+    $(NNTRAINER_ROOT)/nntrainer/models \
+    $(NNTRAINER_ROOT)/nntrainer/optimizers \
+    $(NNTRAINER_ROOT)/nntrainer/compiler \
+    $(NNTRAINER_ROOT)/nntrainer/dataset \
+    $(NNTRAINER_ROOT)/nntrainer/layers/loss \
+    $(NNTRAINER_ROOT)/api/ccapi/include \
+    $(NNTRAINER_ROOT)/api \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
@@ -249,23 +261,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3 \
-    $(LOCAL_PATH)/../models/bert \
-    $(LOCAL_PATH)/../models/deberta_v2 \
-    $(LOCAL_PATH)/../models/gemma4 \
-    $(LOCAL_PATH)/../models/xlm_roberta \
-    $(LOCAL_PATH)/../models/lfm2 \
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 

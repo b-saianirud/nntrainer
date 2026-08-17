@@ -23,6 +23,8 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+
+
 #ifdef ENABLE_FP16
 // Pick the half type the same way tensor_dim.h does, so this header stays
 // self-contained even if a caller pulls it in without tensor_dim.h. On

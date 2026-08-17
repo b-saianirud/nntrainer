@@ -980,8 +980,11 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     rdata = output.getData<float>();
   }
 
+  // Flatten batch × channel × height into M, matching dotFloat's
+  // calculateFlattenDot behavior. Without this, batch > 1 only processes
+  // the first batch's rows, leaving the rest uninitialized → NaN.
   unsigned int M, N, K;
-  M = getDim().height();
+  M = getDim().batch() * getDim().channel() * getDim().height();
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
 
@@ -994,7 +997,6 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     o->gemm_q6_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q4_0: {
-    M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
     if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
