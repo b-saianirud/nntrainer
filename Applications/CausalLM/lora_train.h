@@ -50,11 +50,23 @@ public:
    * @param max_samples optional cap on the number of samples loaded (0 =
    *        no cap)
    * @param seed RNG seed for deterministic epoch shuffling
+   * @param label_token_ids optional closed set of answer tokens. When empty
+   *        (the default) the label is a one-hot over the whole vocabulary and
+   *        the model is trained to pick the answer out of every token it
+   *        knows. When supplied - e.g. the ids of "1".."5" for a 1-5 rating
+   *        task - the label is instead a one-hot over just this list, and the
+   *        model is only asked to rank these against each other. That is the
+   *        label-word / verbalizer formulation the MeZO paper uses for
+   *        classification, and it concentrates the loss on the decision that
+   *        actually matters rather than on suppressing ~150k tokens the
+   *        pretrained model already avoids. The graph must be sliced to match
+   *        (see Transformer::initializeForTraining).
    */
   TrainingDataGenerator(const std::string &data_path,
                         tokenizers::Tokenizer *tokenizer, unsigned int seq_len,
                         unsigned int vocab_size, unsigned int max_samples = 0,
-                        unsigned int seed = 42);
+                        unsigned int seed = 42,
+                        const std::vector<int32_t> &label_token_ids = {});
 
   /**
    * @brief ml::train GENERATOR dataset callback signature.
@@ -78,7 +90,16 @@ private:
   size_t cursor_ = 0;
   unsigned int seq_len_;
   unsigned int vocab_size_;
+  /** answer tokens when restricted; empty means full-vocabulary labels */
+  std::vector<int32_t> label_token_ids_;
   std::mt19937 rng_;
+
+  /** @brief width of the label vector the graph expects */
+  unsigned int labelWidth() const {
+    return label_token_ids_.empty()
+             ? vocab_size_
+             : static_cast<unsigned int>(label_token_ids_.size());
+  }
 
   void loadTextFile(const std::string &path, tokenizers::Tokenizer *tokenizer,
                     unsigned int max_samples);

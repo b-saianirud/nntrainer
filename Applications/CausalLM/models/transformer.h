@@ -252,6 +252,15 @@ public:
   unsigned int getVocabSize() const { return NUM_VOCAB; }
 
   /**
+   * @brief Answer tokens the training head is restricted to, or empty for a
+   *        full-vocabulary objective. The data generator must build labels of
+   *        matching width - see TrainingDataGenerator's label_token_ids.
+   */
+  const std::vector<unsigned int> &getLabelTokenIds() const {
+    return LABEL_TOKEN_IDS;
+  }
+
+  /**
    * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
    */
   tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
@@ -271,15 +280,30 @@ public:
    * @brief Build and compile the symbolic transformer graph for LoRA
    *        training (ExecutionMode::TRAIN), as opposed to initialize()
    *        which always compiles for INFERENCE. Adds a `cross_softmax`
-   *        loss layer on top of constructModel()'s output. Only
-   *        loraA/loraB weights (inside FC layers targeted by lora_target)
-   *        end up trainable; every other layer is frozen — see
-   *        hasLoRA()/appendLoRAProps() and their call sites in
-   *        createAttention()/createMlp()/CausalLM::constructModel().
-   * @param lr learning rate for the Adam optimizer
+   *        loss layer on top of constructModel()'s output. With
+   *        lora_rank > 0, only loraA/loraB weights (inside FC layers
+   *        targeted by lora_target) end up trainable and every other
+   *        layer is frozen — see hasLoRA()/appendLoRAProps() and their
+   *        call sites in createAttention()/createMlp()/
+   *        CausalLM::constructModel(). With lora_rank == 0, none of
+   *        those freeze branches fire and every layer stays trainable
+   *        (full-parameter fine-tuning).
+   * @param lr learning rate; used to build the default Adam optimizer's
+   *        `learning_rate` property when optimizer_type=="adam" and
+   *        optimizer_props is empty. Ignored otherwise — pass the
+   *        optimizer's own learning-rate property inside optimizer_props.
    * @param epochs number of epochs to configure on the model
+   * @param optimizer_type optimizer name understood by
+   *        ml::train::createOptimizer (default "adam", e.g. "MeZO" for
+   *        gradient-free training)
+   * @param optimizer_props properties forwarded to the optimizer
+   *        constructor. When empty and optimizer_type=="adam", defaults
+   *        to {"learning_rate=<lr>"} for backward compatibility.
    */
-  virtual void initializeForTraining(float lr, unsigned int epochs);
+  virtual void
+  initializeForTraining(float lr, unsigned int epochs,
+                        const std::string &optimizer_type = "adam",
+                        const std::vector<std::string> &optimizer_props = {});
 
   /**
    * @brief Set the dataset used for training/validation.
@@ -516,6 +540,15 @@ protected:
   unsigned int LORA_RANK = 0;
   unsigned int LORA_ALPHA = 0;
   std::vector<std::string> LORA_TARGET;
+
+  /** Closed set of answer token ids, from nntr_cfg's "label_token_ids".
+   *  Empty (default) trains against a one-hot over the whole vocabulary.
+   *  When set, initializeForTraining() slices the head down to these tokens
+   *  so the objective is a k-way choice among them - the label-word setup
+   *  used for classification tasks. Ids must be contiguous and ascending;
+   *  the training data's answer tokens must all fall inside the set. Affects
+   *  the training graph only, never inference. */
+  std::vector<unsigned int> LABEL_TOKEN_IDS;
 
   /** Optional gradient clipping for the LoRA weights, from nntr_cfg's
    *  "lora_clip_grad_by_norm". 0 (default) disables it. When set, every

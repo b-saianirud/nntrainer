@@ -65,9 +65,32 @@ TrainingDataGenerator::TrainingDataGenerator(const std::string &data_path,
                                              unsigned int seq_len,
                                              unsigned int vocab_size,
                                              unsigned int max_samples,
-                                             unsigned int seed) :
-  seq_len_(seq_len), vocab_size_(vocab_size), rng_(seed) {
+                                             unsigned int seed,
+                                             const std::vector<int32_t>
+                                               &label_token_ids) :
+  seq_len_(seq_len),
+  vocab_size_(vocab_size),
+  label_token_ids_(label_token_ids),
+  rng_(seed) {
   loadTextFile(data_path, tokenizer, max_samples);
+
+  if (!label_token_ids_.empty()) {
+    /**
+     * Every sample's answer token must be in the set, otherwise the sample has
+     * no representable label and would silently train towards an all-zero
+     * target. Fail loudly at construction instead: a mismatch here usually
+     * means the data or the tokenizer is not what the caller assumed.
+     */
+    for (size_t i = 0; i < samples_.size(); ++i) {
+      const int32_t answer = samples_[i].ids.back();
+      if (std::find(label_token_ids_.begin(), label_token_ids_.end(), answer) ==
+          label_token_ids_.end())
+        throw std::runtime_error(
+          "sample " + std::to_string(i) + " ends with token id " +
+          std::to_string(answer) +
+          ", which is not in the configured label token set");
+    }
+  }
 }
 
 void TrainingDataGenerator::loadTextFile(const std::string &path,
@@ -152,10 +175,21 @@ int TrainingDataGenerator::next(float **input, float **label, bool *last) {
   for (unsigned int i = 0; i < used; ++i)
     in[i] = static_cast<float>(s.ids[i]);
 
-  std::fill(label[0], label[0] + vocab_size_, 0.0f);
   const int32_t label_id = s.ids.back();
-  if (label_id >= 0 && static_cast<unsigned int>(label_id) < vocab_size_)
-    label[0][label_id] = 1.0f;
+  std::fill(label[0], label[0] + labelWidth(), 0.0f);
+  if (label_token_ids_.empty()) {
+    if (label_id >= 0 && static_cast<unsigned int>(label_id) < vocab_size_)
+      label[0][label_id] = 1.0f;
+  } else {
+    /**
+     * The graph's output has been sliced down to these tokens, so the hot
+     * index is the answer's position within the list, not its token id.
+     * Membership was checked at construction.
+     */
+    const auto it =
+      std::find(label_token_ids_.begin(), label_token_ids_.end(), label_id);
+    label[0][std::distance(label_token_ids_.begin(), it)] = 1.0f;
+  }
 
   /**
    * @note The lm head must read the row of the last *real* token

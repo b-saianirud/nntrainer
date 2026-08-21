@@ -932,6 +932,14 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
   bool trainable = lnode->getTrainable();
   if (exec_mode == ExecutionMode::INFERENCE)
     trainable = false;
+  // Gradient-free optimizers (e.g. MeZO) never run backwarding(), so the
+  // gradient tensors would be allocated and zero-filled but never written.
+  // Skipping them here halves peak memory for full-parameter training, which
+  // is the entire point of a zeroth-order optimizer. Weight *variables* are
+  // unaffected and keep TRAIN-mode lifespan, so MeZO can still perturb them
+  // in place across steps.
+  if (skip_gradients)
+    trainable = false;
 
   auto context = ct_engine.getRegisteredContext(lnode->getComputeEngineType());
 

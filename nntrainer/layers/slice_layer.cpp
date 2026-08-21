@@ -28,16 +28,16 @@ void SliceLayer::finalize(InitLayerContext &context) {
   start = std::get<props::StartIndex>(slice_props).get() - 1;
   unsigned int end = std::get<props::EndIndex>(slice_props).get() - 1;
 
-  const TensorDim &in_dim = context.getInputDimensions()[0];
   TensorDim outputDim = context.getInputDimensions()[0];
 
-  for (unsigned int i = 0; i < 4; ++i) {
-    if (i == axis) {
-      outputDim[i] = end - start;
-    } else {
-      outputDim[i] = in_dim[i];
-    }
-  }
+  /**
+   * setTensorDim() must be used rather than operator[]: the latter hands back a
+   * bare reference into dim[] and never calls resetLen(), which would leave the
+   * output dim reporting the *input's* getDataLen(). Downstream consumers that
+   * derive a batch count from getDataLen() / width() -- ActiFunc::softmax among
+   * them -- then read far past the end of the sliced tensor.
+   */
+  outputDim.setTensorDim(axis, end - start);
 
   context.setOutputDimensions({outputDim});
 }
@@ -62,6 +62,11 @@ void SliceLayer::forwarding_operation(const Tensor &input, Tensor &output) {
 void SliceLayer::calcDerivative(RunLayerContext &context) {
   const Tensor &inDeriv = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   Tensor &outDeriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+
+  /** positions outside the sliced window contribute nothing to the loss, so
+   * their derivative is zero -- but the buffer is pooled and holds whatever the
+   * previous tenant left behind, so it has to be cleared explicitly. */
+  outDeriv.setZero();
 
   for (unsigned int b = 0; b < inDeriv.batch(); ++b) {
     for (unsigned int c = 0; c < inDeriv.channel(); ++c) {

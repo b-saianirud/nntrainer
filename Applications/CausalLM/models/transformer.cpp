@@ -214,6 +214,10 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   LORA_TARGET = nntr_cfg.contains("lora_target")
                   ? nntr_cfg["lora_target"].get<std::vector<std::string>>()
                   : std::vector<std::string>();
+  LABEL_TOKEN_IDS =
+    nntr_cfg.contains("label_token_ids")
+      ? nntr_cfg["label_token_ids"].get<std::vector<unsigned int>>()
+      : std::vector<unsigned int>();
   LORA_CLIP_GRAD = nntr_cfg.contains("lora_clip_grad_by_norm")
                      ? nntr_cfg["lora_clip_grad_by_norm"].get<float>()
                      : 0.0f;
@@ -282,7 +286,9 @@ void Transformer::initialize() {
 /**
  * @brief Build and compile the symbolic transformer graph for LoRA training.
  */
-void Transformer::initializeForTraining(float lr, unsigned int epochs) {
+void Transformer::initializeForTraining(
+  float lr, unsigned int epochs, const std::string &optimizer_type,
+  const std::vector<std::string> &optimizer_props) {
   FOR_TRAINING = true;
 
   registerCustomLayers();
@@ -294,13 +300,54 @@ void Transformer::initializeForTraining(float lr, unsigned int epochs) {
     withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
   model->setProperty(model_props);
 
-  auto optimizer =
-    ml::train::createOptimizer("adam", {withKey("learning_rate", lr)});
+  std::vector<std::string> props = optimizer_props;
+  if (props.empty() && optimizer_type == "adam") {
+    props = {withKey("learning_rate", lr)};
+  }
+  auto optimizer = ml::train::createOptimizer(optimizer_type, props);
   if (model->setOptimizer(std::move(optimizer))) {
     throw std::invalid_argument("Failed to set optimizer.");
   }
 
   auto [x, h] = constructModel();
+
+  /**
+   * Optionally narrow the head to a closed set of answer tokens before the
+   * loss, so training is a k-way choice among them rather than a softmax over
+   * the whole vocabulary. For a 1-5 rating task that is 5 logits instead of
+   * ~152k: chance-level loss drops from ln(151936)=11.9 to ln(5)=1.6, and the
+   * loss stops being dominated by suppressing tokens the pretrained model was
+   * never going to emit. Only the training graph is affected - initialize()
+   * still builds the full head for inference.
+   *
+   * @note This uses the `slice` layer, so the ids must be contiguous. That
+   * covers the digit tokens of the usual rating tasks; a non-contiguous set
+   * would need a gather (which takes its indices as a second graph input) and
+   * is rejected below rather than silently mistrained.
+   */
+  if (!LABEL_TOKEN_IDS.empty()) {
+    const unsigned int first = LABEL_TOKEN_IDS.front();
+    for (size_t i = 1; i < LABEL_TOKEN_IDS.size(); ++i) {
+      if (LABEL_TOKEN_IDS[i] != first + i)
+        throw std::invalid_argument(
+          "label_token_ids must be contiguous and ascending; got a gap at "
+          "index " +
+          std::to_string(i));
+    }
+    /**
+     * @note SliceLayer treats these properties as 1-based: internally it does
+     * start = start_index - 1, and sizes the output as (end - start). So to
+     * keep tokens [first, first + n) the properties are first + 1 and
+     * first + n + 1.
+     */
+    const unsigned int n =
+      static_cast<unsigned int>(LABEL_TOKEN_IDS.size());
+    LayerHandle label_slice(createLayer(
+      "slice", {withKey("name", "label_token_slice"),
+                withKey("start_index", first + 1),
+                withKey("end_index", first + n + 1), withKey("axis", 3)}));
+    h = label_slice(h);
+  }
 
   LayerHandle loss(
     createLayer("cross_softmax", {withKey("name", "loss")}));

@@ -693,6 +693,16 @@ private:
 
   float loss; /**< loss */
 
+  /**
+   * A gradient-free optimizer's last forward pass is a perturbed probe, so
+   * the layers' stored loss does not describe the weights being trained. When
+   * valid, getLoss() reports this optimizer-supplied value instead. Any real
+   * forwarding() invalidates it, so validation and the probe passes inside
+   * trainStep() keep reading the genuine per-layer loss.
+   */
+  float gradient_free_loss = 0.0f;
+  bool gradient_free_loss_valid = false;
+
   std::shared_ptr<OptimizerWrapped> opt; /**< Optimizer; this gets copied into
                     each layer, do not use this directly */
 
@@ -796,6 +806,13 @@ private:
    * @retval true if matches, false is error
    */
   bool validateInput(sharedConstTensors X);
+
+  /**
+   * @brief Get pointers to all trainable weight parameters with their sizes
+   * @return std::vector<std::pair<float*, size_t>> Vector of pointers to weight
+   * parameters and their sizes
+   */
+  std::vector<nntrainer::Tensor *> getParameterPointers();
 };
 
 } /* namespace nntrainer */

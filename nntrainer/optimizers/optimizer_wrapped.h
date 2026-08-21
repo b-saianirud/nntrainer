@@ -52,6 +52,24 @@ public:
    */
 
   /**
+   * @brief     Check if this optimizer requires backpropagation
+   * @retval    true if backprop is required, false otherwise
+   */
+  bool requiresBackprop() const { return optimizer->requiresBackprop(); }
+
+  /**
+   * @brief     Custom training step for gradient-free optimizers
+   * @param[in] forward_fn Function to perform forward pass
+   * @param[in] get_loss_fn Function to get current loss
+   * @param[in] params Vector of parameter tensors to update
+   */
+  float trainStep(std::function<void()> forward_fn,
+                  std::function<float()> get_loss_fn,
+                  std::vector<Tensor *> &params) {
+    return optimizer->trainStep(forward_fn, get_loss_fn, params);
+  }
+
+  /**
    * @brief     get Optimizer Type
    * @retval    Optimizer type
    */

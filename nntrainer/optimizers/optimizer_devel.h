@@ -39,6 +39,27 @@ public:
   virtual ~Optimizer() = default;
 
   /**
+   * @brief     Check if this optimizer requires backpropagation
+   * @retval    true if backprop is required, false otherwise
+   */
+  virtual bool requiresBackprop() const { return true; }
+
+  /**
+   * @brief     Custom training step for gradient-free optimizers
+   * @param[in] forward_fn Function to perform forward pass
+   * @param[in] get_loss_fn Function to get current loss
+   * @param[in] params Vector of parameter tensors to update
+   * @note      Default is no-op; gradient-free optimizers override this.
+   * @return    Loss representative of the *unperturbed* parameters for this
+   *            step, for reporting. Returns 0 for the default no-op.
+   */
+  virtual float trainStep(std::function<void()> forward_fn,
+                          std::function<float()> get_loss_fn,
+                          std::vector<Tensor *> &params) {
+    return 0.0f;
+  };
+
+  /**
    * @brief     get Learning Rate
    * @retval    Learning rate in float
    */

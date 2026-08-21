@@ -37,6 +37,7 @@ enum OptimizerType {
   ADAMW = ML_TRAIN_OPTIMIZER_TYPE_ADAMW,    /** AdamW */
   LION = ML_TRAIN_OPTIMIZER_TYPE_LION,      /** Lion */
   SGD = ML_TRAIN_OPTIMIZER_TYPE_SGD,        /** sgd */
+  MeZO = ML_TRAIN_OPTIMIZER_TYPE_MeZO,      /** MeZO */
   UNKNOWN = ML_TRAIN_OPTIMIZER_TYPE_UNKNOWN /** unknown */
 };
 
@@ -151,6 +152,14 @@ AdamW(const std::vector<std::string> &properties = {}) {
 inline std::unique_ptr<Optimizer>
 Lion(const std::vector<std::string> &properties = {}) {
   return createOptimizer(OptimizerType::LION, properties);
+}
+
+/**
+ * @brief Helper function to create MeZO Optimizer
+ */
+inline std::unique_ptr<Optimizer>
+MeZO(const std::vector<std::string> &properties = {}) {
+  return createOptimizer(OptimizerType::MeZO, properties);
 }
 
 } // namespace optimizer

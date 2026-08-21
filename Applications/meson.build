@@ -57,3 +57,8 @@ if get_option('enable-transformer')
 endif
 
 subdir('Optimizers/jni')
+
+# MeZO training example
+if get_option('platform') != 'tizen' and host_machine.system() != 'windows'
+  subdir('MeZO/jni')
+endif

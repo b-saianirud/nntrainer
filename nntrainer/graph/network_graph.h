@@ -412,6 +412,13 @@ public:
   }
 
   /**
+   * @brief Skip per-weight gradient allocation for gradient-free optimizers.
+   * @note Must be called before compile()/initialize(), since the decision is
+   *       made in finalizeContext() when weights are requested.
+   */
+  void setSkipGradients(bool skip) { skip_gradients = skip; }
+
+  /**
    * @brief Allocate memory for all the managed weights
    */
   void allocateWeights(bool init = true) {
@@ -625,6 +632,11 @@ private:
   bool optimize_memory;    /**< optimize memory */
   ExecutionMode exec_mode; /**< execution mode with which the graph has been
                             currently set or previously set */
+  bool skip_gradients =
+    false; /**< skip allocating per-weight gradient tensors. Set for
+              gradient-free (zeroth-order) optimizers such as MeZO, which
+              never call backwarding() and so would otherwise reserve a
+              full model-sized gradient buffer that is never written. */
 
   std::string tensor_format; /**< Model Tensor Format: NCHW or NHWC */
 
