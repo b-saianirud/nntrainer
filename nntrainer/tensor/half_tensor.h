@@ -528,6 +528,22 @@ private:
                  float beta, Tdatatype dtype) const;
 
   /**
+   * @brief Batched dot product for multiple weights sharing one activation.
+   *
+   * For quantized inputs (Q4_0, Q6_K), dispatches each weight through the
+   * single-weight dotQnK path (which may offload to the Hexagon cDSP).
+   * For non-quantized inputs, falls back to per-weight single dot().
+   *
+   * @param input vector of weight tensors
+   * @param output vector of output tensors
+   * @param trans transpose this tensor
+   * @param trans_in transpose input tensor
+   * @param beta beta value for the dot product
+   */
+  void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+           bool trans, bool trans_in, float beta) const;
+
+  /**
    * @copydoc Tensor::isValid()
    */
   bool isValid() const override;

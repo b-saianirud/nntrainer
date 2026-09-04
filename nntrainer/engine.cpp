@@ -24,6 +24,10 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 
+#if defined(ENABLE_HEXAGON_CDSP) && ENABLE_HEXAGON_CDSP == 1
+#include <hexagon_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -72,6 +76,16 @@ void Engine::add_default_object() {
   } catch (std::exception &e) {
     ml_logw("QNN context plugin not available: %s", e.what());
   }
+#endif
+
+#if defined(ENABLE_HEXAGON_CDSP) && ENABLE_HEXAGON_CDSP == 1
+  // Hexagon cDSP context - direct FastRPC/HVX/HMX dispatch, not QNN's graph
+  // compiler. Uses dlopen/dlsym for libggml-hexagon.so and libcdsprpc.so at
+  // runtime, so it is linked directly like the GPU context rather than loaded
+  // as a plugin .so.
+  auto &hexagon_context = nntrainer::HexagonContext::Global();
+
+  registerContext("cdsp", &hexagon_context);
 #endif
 }
 

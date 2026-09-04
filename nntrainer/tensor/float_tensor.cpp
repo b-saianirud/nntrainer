@@ -21,6 +21,7 @@
 #include <thread_manager.h>
 
 #include <tensor.h>
+
 #include <util_func.h>
 
 #include <compute_ops.h>
@@ -771,7 +772,13 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
 void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
                       bool trans, bool trans_in, float beta) const {
   float *data = (float *)getData();
-  unsigned int M = getDim().height();
+  // batch()*channel()*height() flattened into one row count, matching
+  // calculateFlattenDot's NCHW convention (tensor_base.cpp) - not height()
+  // alone. This tensor's data buffer is batch*channel*height*width contiguous
+  // floats; treating only height() as M silently drops every batch/channel
+  // beyond the first when batch()*channel() > 1.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
@@ -795,6 +802,12 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
 
   auto *o = getOps();
   if (input_dtype == Tdatatype::Q4_0) {
+    // Same M threshold as the single-weight path (dotQnK) - the backend's to
+    // declare via gemm_q4_0_accel_min_rows(), not a hardcoded `M > 1`. Hexagon
+    // cDSP lowers this to 1 (decode included, see
+    // HexagonComputeOps::gemm_q4_0_accel_min_rows), so QKVLayer/GateUpLayer's
+    // batched dot() collapses into one dispatch at decode too - the M == 1
+    // regime that is actually the whole point of batching Q/K/V and gate/up.
     if (o->supports_gemm_q4_0_batch_fp32() &&
         M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
@@ -805,6 +818,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       }
     }
   } else { // QINT4
+
+
     if (o->supports_gemv_int4_batch_fp32() &&
         input[0]->getMemoryData()->isSVM() &&
         output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
@@ -981,10 +996,10 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     rdata = output.getData<float>();
   }
 
-  // Flatten batch × channel × height into M, matching dotFloat's
-  // calculateFlattenDot behavior. Without this, batch > 1 only processes
-  // the first batch's rows, leaving the rest uninitialized → NaN.
   unsigned int M, N, K;
+  // batch()*channel()*height() flattened, per calculateFlattenDot's NCHW
+  // convention (tensor_base.cpp) - height() alone silently dropped every
+  // batch/channel beyond the first whenever batch()*channel() > 1.
   M = getDim().batch() * getDim().channel() * getDim().height();
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
@@ -998,8 +1013,13 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     o->gemm_q6_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q4_0: {
+    M = getDim().batch() * getDim().channel() * getDim().height();
     K = getDim().width();
     N = input.getDim().width();
+    // The M threshold is the backend's to declare (see
+    // ComputeOps::gemm_q4_0_accel_min_rows) - it defaults to 2, preserving the
+    // `M > 1` behaviour this used to hardcode. Hexagon cDSP lowers it to 1
+    // because its q4x4x2 weights have no valid CPU fallback.
     if (o->supports_gemm_q4_0_accel_fp32() &&
         M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
@@ -1008,6 +1028,8 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     }
     break;
   }
+
+
 
   default:
     throw std::invalid_argument("Error: unsupported datatype");
@@ -1033,7 +1055,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   char *mdata = input.getData<char>();
   float *rdata = output.getData<float>();
 
-  unsigned int M = getDim().height();
+  // See dotQnK above - batch()*channel()*height() flattened, not height()
+  // alone.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
@@ -1058,7 +1083,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
 Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
                               bool trans_in, float beta,
                               Tdatatype dtype) const {
-  unsigned int M = getDim().height();
+  // See dotQnK above - batch()*channel()*height() flattened, not height()
+  // alone.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
