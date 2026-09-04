@@ -68,6 +68,10 @@ if get_option('enable-npu')
   # The qnn subdir is processed after nntrainer_dep is available (see below).
 endif
 
+if get_option('enable-hexagon-cdsp')
+  nntrainer_elements += 'hexagon'
+endif
+
 foreach elem : nntrainer_elements
   if elem != 'qnn'
     subdir(elem)
