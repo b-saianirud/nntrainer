@@ -795,7 +795,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
 
   auto *o = getOps();
   if (input_dtype == Tdatatype::Q4_0) {
-    if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
+    if (o->supports_gemm_q4_0_batch_fp32() &&
+        M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
       for (unsigned int i = 0; i < input.size(); ++i) {
@@ -999,7 +1000,8 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   case Tdatatype::Q4_0: {
     K = getDim().width();
     N = input.getDim().width();
-    if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
+    if (o->supports_gemm_q4_0_accel_fp32() &&
+        M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
       o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);

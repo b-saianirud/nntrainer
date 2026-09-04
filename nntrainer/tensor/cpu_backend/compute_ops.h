@@ -210,6 +210,21 @@ public:
                                     unsigned int K);
 
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
+  /**
+   * @brief Minimum activation row count (M) at which gemm_q4_0_accel_fp32 is
+   * worth using over the plain CPU gemm_q4_0_fp32/GEMV path.
+   *
+   * Backend-declared rather than hardcoded in float_tensor.cpp, because the
+   * right threshold is a property of the accelerator, not of the caller:
+   *   - OpenCL (ClComputeOps) wants M >= 2, the long-standing behaviour when
+   *     this was a literal `M > 1` test at the call site.
+   *   - Hexagon cDSP wants M >= 1, because its weights are repacked into the
+   *     HTP q4x4x2 layout, which the CPU kernel cannot read - falling back to
+   *     the CPU for M == 1 would silently misinterpret those bytes as
+   *     q4_0x4/x8 and emit garbage, so there is no valid fallback to take.
+   * Defaults to 2 so no existing backend changes behaviour.
+   */
+  virtual unsigned int gemm_q4_0_accel_min_rows() const { return 2; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
                                     unsigned int N, unsigned int K);
@@ -364,6 +379,25 @@ public:
                               const unsigned int lda, const void *B,
                               const unsigned int ldb, _FP16 *C,
                               const unsigned int ldc);
+
+  /**
+   * @brief Whether this backend supports NPU-accelerated Q4_0 GEMM with FP16
+   * activations. When true, HalfTensor::dotQnK calls gemm_q4_0_accel_fp16
+   * instead of the CPU gemm_q4_0_fp16.
+   */
+  virtual bool supports_gemm_q4_0_accel_fp16() const { return false; }
+
+  /**
+   * @brief NPU-accelerated Q4_0 GEMM with FP16 activations.
+   *
+   * Computes C[M,N] = A[M,K] @ B[N,K]^T where A is FP16, B is Q4_0, C is FP16.
+   * Dispatches to the DSP's HMX 4-bit matmul unit via the bridge.
+   */
+  virtual void gemm_q4_0_accel_fp16(void *matAdata, _FP16 *matBdata,
+                                    _FP16 *matCdata, unsigned int M,
+                                    unsigned int N, unsigned int K) {
+    // Default: no NPU support — caller falls back to gemm_q4_0_fp16.
+  }
 
   // ===========================================================================
   // Rotary embedding

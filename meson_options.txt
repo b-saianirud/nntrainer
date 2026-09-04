@@ -20,6 +20,7 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
+option('enable-hexagon-cdsp', type: 'boolean', value: false)
 # Path to a locally-installed Qualcomm QNN SDK. When enable-npu=true, either
 # this option or the QNN_SDK_ROOT environment variable must be set; the option
 # takes priority when both are provided. The SDK root is used at configure time
