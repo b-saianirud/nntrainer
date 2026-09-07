@@ -42,6 +42,7 @@ causallm_layer_dependencies += [
     causallm_per_layer_slice_dep,
     causallm_scalar_multiply_dep,
     causallm_logit_softcapping_dep,
+    causallm_fused_ffn_dep,
 ]
 
 subdir('models')
