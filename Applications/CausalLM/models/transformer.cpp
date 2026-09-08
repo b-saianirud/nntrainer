@@ -29,6 +29,8 @@
 #include <cpu_backend.h>
 #include <embedding_layer.h>
 #include <fc_layer.h>
+#include <fused_ffn_layer.h>
+#include <hexagon_context.h>
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
@@ -1026,7 +1028,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wq_props);
   else if (LORA_RANK > 0)
     wq_props.push_back(withKey("trainable", "false"));
-  LayerHandle wq(createLayer("fully_connected", wq_props));
+  LayerHandle wq(createLayer("fully_connected", withHexagonEngine(wq_props)));
   Tensor q = wq(query);
 
   // K layer
@@ -1038,7 +1040,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wk_props);
   else if (LORA_RANK > 0)
     wk_props.push_back(withKey("trainable", "false"));
-  LayerHandle wk(createLayer("fully_connected", wk_props));
+  LayerHandle wk(createLayer("fully_connected", withHexagonEngine(wk_props)));
   Tensor k = wk(key);
 
   // V layer
@@ -1050,7 +1052,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wv_props);
   else if (LORA_RANK > 0)
     wv_props.push_back(withKey("trainable", "false"));
-  LayerHandle wv(createLayer("fully_connected", wv_props));
+  LayerHandle wv(createLayer("fully_connected", withHexagonEngine(wv_props)));
   Tensor v = wv(value);
 
   // Attention core layer (frozen: GQA has no learnable weights beyond
@@ -1091,7 +1093,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wo_props);
   else if (LORA_RANK > 0)
     wo_props.push_back(withKey("trainable", "false"));
-  LayerHandle wo(createLayer("fully_connected", wo_props));
+  LayerHandle wo(
+    createLayer("fully_connected", withHexagonEngine(wo_props)));
   return wo(a);
 }
 
@@ -1109,7 +1112,8 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     appendLoRAProps(ffn_up_props);
   else if (LORA_RANK > 0)
     ffn_up_props.push_back(withKey("trainable", "false"));
-  LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
+  LayerHandle ffn_up(
+    createLayer("fully_connected", withHexagonEngine(ffn_up_props)));
   Tensor up = ffn_up(input);
 
   std::vector<std::string> ffn_gate_props = {
@@ -1120,7 +1124,8 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     appendLoRAProps(ffn_gate_props);
   else if (LORA_RANK > 0)
     ffn_gate_props.push_back(withKey("trainable", "false"));
-  LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
+  LayerHandle ffn_gate(
+    createLayer("fully_connected", withHexagonEngine(ffn_gate_props)));
   Tensor gate = ffn_gate(input);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
@@ -1141,7 +1146,8 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     appendLoRAProps(ffn_down_props);
   else if (LORA_RANK > 0)
     ffn_down_props.push_back(withKey("trainable", "false"));
-  LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
+  LayerHandle ffn_down(
+    createLayer("fully_connected", withHexagonEngine(ffn_down_props)));
   return ffn_down(act);
 }
 
@@ -1164,6 +1170,11 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
+
+    // Register fused_ffn layer under both "cpu" and "cdsp" contexts so it
+    // can be created when withHexagonEngine() tags the layer as engine=cdsp.
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::FusedFFNLayer>, "fused_ffn");
   });
 }
 
