@@ -33,6 +33,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/hexagon \
     $(NNTRAINER_ROOT)/nntrainer/layers \
     $(NNTRAINER_ROOT)/nntrainer \
     $(NNTRAINER_ROOT)/nntrainer/utils \
@@ -122,6 +123,7 @@ LOCAL_SRC_FILES := \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../layers/fused_ffn_layer.cpp \
     ../api/streamer.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
