@@ -258,6 +258,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../layers/fused_ffn_layer.cpp \
     ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
