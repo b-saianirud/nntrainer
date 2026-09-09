@@ -125,10 +125,9 @@ const BridgeApi &get_bridge_api() {
   static BridgeApi api = [] {
     void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
-      std::ostringstream oss;
-      oss << "HexagonComputeOps: dlopen(libggml-hexagon.so) failed: "
-          << dlerror();
-      throw std::runtime_error(oss.str());
+      ml_logw("HexagonComputeOps: dlopen(libggml-hexagon.so) failed: %s "
+              "- all ops will fall back to CPU", dlerror());
+      return BridgeApi{};
     }
 
     auto sym = [handle](const char *name) {
@@ -189,7 +188,10 @@ const BridgeApi &get_bridge_api() {
 
 class HexagonComputeOps : public ComputeOps {
 public:
-  bool supports_gemm_q4_0_accel_fp32() const override { return true; }
+  bool supports_gemm_q4_0_accel_fp32() const override {
+    const BridgeApi *api = get_locked_bridge_api();
+    return api->gemm != nullptr;
+  }
 
   /**
    * @brief Rows of activation at or above which the Q4_0 GEMM goes to the cDSP.
@@ -249,6 +251,10 @@ public:
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
     const BridgeApi *api = get_locked_bridge_api();
+    if (!api->gemm) {
+      cpu_->gemm_q4_0_fp32(M, N, K, matBdata, K, matAdata, N, matCdata, N);
+      return;
+    }
     ensure_uploaded(*api, matAdata, N, K);
 
     int rc = api->gemm(matAdata, matBdata, matCdata, M, N, K);
@@ -270,13 +276,23 @@ public:
   // FloatTensor::dot(vector<Tensor*>, ...). Collapses what would be N
   // separate gemm_q4_0_accel_fp32 calls (N FastRPC round trips) into one
   // nntr_htp_bridge_gemm_q4_0_batch call (one round trip).
-  bool supports_gemm_q4_0_batch_fp32() const override { return true; }
+  bool supports_gemm_q4_0_batch_fp32() const override {
+    const BridgeApi *api = get_locked_bridge_api();
+    return api->gemm_batch != nullptr;
+  }
 
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
                             std::vector<float *> matCdata, unsigned int M,
                             std::vector<unsigned int> N,
                             unsigned int K) override {
     const BridgeApi *api = get_locked_bridge_api();
+    if (!api->gemm_batch) {
+      for (size_t i = 0; i < matAdata.size(); ++i) {
+        cpu_->gemm_q4_0_fp32(M, N[i], K, matBdata, K, matAdata[i], N[i],
+                            matCdata[i], N[i]);
+      }
+      return;
+    }
 
     std::vector<const void *> keys(matAdata.size());
     for (size_t i = 0; i < matAdata.size(); ++i) {
