@@ -541,7 +541,7 @@ private:
    * @param beta beta value for the dot product
    */
   void dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
-           bool trans, bool trans_in, float beta) const;
+           bool trans, bool trans_in, float beta) const override;
 
   /**
    * @copydoc Tensor::isValid()
