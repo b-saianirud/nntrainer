@@ -55,6 +55,7 @@
 #include <embedding.h>
 #include <fc_layer.h>
 #include <flatten_layer.h>
+#include <gate_up_layer.h>
 #include <gather_layer.h>
 #include <gru.h>
 #include <grucell.h>
@@ -85,6 +86,7 @@
 #include <preprocess_flip_layer.h>
 #include <preprocess_l2norm_layer.h>
 #include <preprocess_translate_layer.h>
+#include <qkv_layer.h>
 #include <reduce_mean_layer.h>
 #include <reduce_sum_layer.h>
 #include <rnn.h>
@@ -330,6 +332,8 @@ void AppContext::add_default_object() {
                   LayerType::LAYER_NEG);
   registerFactory(nntrainer::createLayer<FullyConnectedLayer>,
                   FullyConnectedLayer::type, LayerType::LAYER_FC);
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  registerFactory(nntrainer::createLayer<GateUpLayer>, GateUpLayer::type);
   registerFactory(nntrainer::createLayer<BatchNormalizationLayer>,
                   BatchNormalizationLayer::type, LayerType::LAYER_BN);
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
