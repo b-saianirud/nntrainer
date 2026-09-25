@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <mutex>
 #include <unordered_map>
 
@@ -802,7 +803,8 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     withKey("packed", "false")};
   if (LORA_RANK > 0 && !TRAIN_NORMS)
     out_norm_props.push_back(withKey("trainable", "false"));
-  LayerHandle out_norm(createLayer("rms_norm", out_norm_props));
+  LayerHandle out_norm(
+    createLayer("rms_norm", withHexagonEngine(out_norm_props)));
   h = out_norm(h);
 
   return {x, h};
@@ -947,7 +949,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
   if (LORA_RANK > 0 && !TRAIN_NORMS)
     attn_norm_props.push_back(withKey("trainable", "false"));
-  LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
+  LayerHandle attn_norm(
+    createLayer("rms_norm", withHexagonEngine(attn_norm_props)));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -955,7 +958,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")})));
   Tensor residual = decoder_add({input, att_out});
 
   std::vector<std::string> ffn_norm_props = {
@@ -963,14 +967,16 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
   if (LORA_RANK > 0 && !TRAIN_NORMS)
     ffn_norm_props.push_back(withKey("trainable", "false"));
-  LayerHandle ffn_norm(createLayer("rms_norm", ffn_norm_props));
+  LayerHandle ffn_norm(
+    createLayer("rms_norm", withHexagonEngine(ffn_norm_props)));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    withHexagonEngine({withKey("name", "layer" + std::to_string(layer_id) +
+                                         "_decoder_output")})));
   return decoder_output({residual, ffn_out});
 }
 
@@ -1104,6 +1110,18 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
+  static const char *fused_env = std::getenv("NNTR_HEXAGON_FUSED_FFN");
+  static const bool use_fused = (fused_env && std::atoi(fused_env) == 1);
+  if (use_fused) {
+    std::vector<std::string> fused_ffn_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_ffn_fused"),
+      withKey("hidden_dim", hidden_dim), withKey("unit", dim),
+      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+    LayerHandle ffn_fused(
+      createLayer("fused_ffn", withHexagonEngine(fused_ffn_props)));
+    return ffn_fused(input);
+  }
+
   std::vector<std::string> ffn_up_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
@@ -1175,6 +1193,22 @@ void Transformer::registerCustomLayers() {
     // can be created when withHexagonEngine() tags the layer as engine=cdsp.
     app_context->registerFactory(
       nntrainer::createLayer<causallm::FusedFFNLayer>, "fused_ffn");
+
+    try {
+      const auto cdsp_context = static_cast<nntrainer::AppContext *>(
+        ct_engine.getRegisteredContext("cdsp"));
+      cdsp_context->registerFactory(
+        nntrainer::createLayer<causallm::RMSNormLayer>);
+      cdsp_context->registerFactory(
+        nntrainer::createLayer<causallm::MHACoreLayer>);
+      cdsp_context->registerFactory(
+        nntrainer::createLayer<causallm::FusedFFNLayer>, "fused_ffn");
+    } catch (const std::invalid_argument &) {
+      // "cdsp" context is not registered (e.g. hexagon support disabled at
+      // build time) - nothing to do.
+    } catch (const std::exception &) {
+      // Factory already registered under "cdsp" - ignore.
+    }
   });
 }
 
