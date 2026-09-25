@@ -969,6 +969,10 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   run_context = std::make_unique<RunLayerContext>(
     getName(), getTrainable(), 0.0f, getInPlaceType() != InPlaceType::NONE,
     loss_scale, ct_data, false, weights, inputs, outputs, tensors);
+  // Thread compute_engine (set from the "engine=" property in finalize())
+  // into the RunLayerContext so layers can query it in forwarding()/
+  // incremental_forwarding() without independently probing env vars/dlopen.
+  run_context->setComputeEngineType(compute_engine);
 }
 
 /**
