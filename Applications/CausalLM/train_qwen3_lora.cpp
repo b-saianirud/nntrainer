@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 
 
@@ -119,6 +120,9 @@ void printUsage(const char *prog) {
     << "  --lora_rank <int>     LoRA rank; overrides nntr_config.json\n"
     << "  --lora_alpha <int>    LoRA alpha; overrides nntr_config.json\n"
     << "  --max_samples <int>   cap the number of training samples\n"
+    << "  --val_data <path>     separate validation data file (default:\n"
+    << "                        reuse the training data for validation)\n"
+    << "  --max_val_samples <int> cap the number of validation samples\n"
     << "  --seq_len <int>       training sequence length; overrides\n"
     << "                        nntr_config.json's init_seq_len. Attention\n"
     << "                        memory is quadratic in this, so prefer the\n"
@@ -146,6 +150,7 @@ struct EpochState {
   std::string q4_output_path; // empty unless --lora_weight_q4 was passed
   unsigned int epoch = 0;
   float best_loss = std::numeric_limits<float>::max();
+  float best_acc = -1.0f;
   int thermal_zone = 0;
   long total_mem_kb = -1;
   std::chrono::steady_clock::time_point train_start;
@@ -183,7 +188,9 @@ void onEpochComplete(void *user_data) {
   std::cout << "  Epoch " << st->epoch << " Summary" << std::endl;
   std::cout << "========================================" << std::endl;
   std::cout << "  train_loss:    " << train_stats.loss << std::endl;
+  std::cout << "  train_acc:     " << train_stats.accuracy << std::endl;
   std::cout << "  valid_loss:    " << valid_stats.loss << std::endl;
+  std::cout << "  valid_acc:     " << valid_stats.accuracy << std::endl;
   std::cout << "  time (epoch):  " << epoch_duration << " s" << std::endl;
   std::cout << "  time (total):  " << total_duration << " s" << std::endl;
   if (temp_c >= 0)
@@ -196,9 +203,10 @@ void onEpochComplete(void *user_data) {
   }
   std::cout << "========================================" << std::endl;
 
-  // Save whenever validation loss improves, so an interrupted run still
+  // Save whenever validation accuracy improves, so an interrupted run still
   // leaves the best adapter on disk.
-  if (valid_stats.loss < st->best_loss) {
+  if (valid_stats.accuracy > st->best_acc) {
+    st->best_acc = valid_stats.accuracy;
     st->best_loss = valid_stats.loss;
     try {
       st->model->save_weight_lora(st->output_path);
@@ -241,6 +249,8 @@ int main(int argc, char *argv[]) {
   unsigned int lora_rank_override = 0;
   unsigned int lora_alpha_override = 0;
   unsigned int max_samples = 0;
+  std::string val_data_path;
+  unsigned int max_val_samples = 0;
   unsigned int seq_len_override = 0;
   float clip_grad = -1.0f;
   bool train_norms = false;
@@ -274,6 +284,11 @@ int main(int argc, char *argv[]) {
       else if (arg == "--max_samples")
         max_samples =
           static_cast<unsigned int>(std::stoul(next("--max_samples")));
+      else if (arg == "--val_data")
+        val_data_path = next("--val_data");
+      else if (arg == "--max_val_samples")
+        max_val_samples =
+          static_cast<unsigned int>(std::stoul(next("--max_val_samples")));
       else if (arg == "--seq_len")
         seq_len_override =
           static_cast<unsigned int>(std::stoul(next("--seq_len")));
@@ -419,7 +434,21 @@ int main(int argc, char *argv[]) {
       ml::train::DatasetType::GENERATOR, causallm::trainingDataGenCb,
       &data_gen);
     model.setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset);
-    model.setDataset(ml::train::DatasetModeType::MODE_VALID, dataset);
+
+    // Use a separate validation file when provided; otherwise fall back to
+    // reusing the training data (original behavior).
+    std::unique_ptr<causallm::TrainingDataGenerator> val_gen;
+    if (!val_data_path.empty()) {
+      val_gen = std::make_unique<causallm::TrainingDataGenerator>(
+        val_data_path, tokenizer, seq_len, vocab_size, max_val_samples, seed);
+      std::cout << "val_samples:  " << val_gen->size() << std::endl;
+      std::shared_ptr<ml::train::Dataset> val_dataset =
+        ml::train::createDataset(ml::train::DatasetType::GENERATOR,
+                                 causallm::trainingDataGenCb, val_gen.get());
+      model.setDataset(ml::train::DatasetModeType::MODE_VALID, val_dataset);
+    } else {
+      model.setDataset(ml::train::DatasetModeType::MODE_VALID, dataset);
+    }
 
     // Set up per-epoch monitoring state
     int thermal_zone = findCpuThermalZone();
