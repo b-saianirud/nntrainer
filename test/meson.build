@@ -56,6 +56,40 @@ if enable_ccapi
   subdir('unittest')
 endif
 
+# MNIST NPU training driver — validates FP32 GEMM dispatch to Hexagon cDSP.
+# Built whenever ccapi is enabled. The binary works as a CPU trainer when
+# the hexagon bridge is not available (sgemm_fp32 falls back to CPU).
+if enable_ccapi
+  mnist_npu_train_exe = executable(
+    'mnist_npu_train',
+    'mnist_npu_train.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    include_directories: nntrainer_test_inc,
+    install: true,
+    install_dir: nntrainer_bindir,
+  )
+endif
+
+# Standalone NPU training tests — bypass nntrainer's layer system and call
+# the hexagon bridge directly via dlsym. No ccapi dependency needed.
+mnist_npu_fused_train_exe = executable(
+  'mnist_npu_fused_train',
+  'mnist_npu_fused_train.cpp',
+  dependencies: [nntrainer_dep],
+  include_directories: nntrainer_test_inc,
+  install: true,
+  install_dir: nntrainer_bindir,
+)
+
+mnist_npu_bench_exe = executable(
+  'mnist_npu_bench',
+  'mnist_npu_bench.cpp',
+  dependencies: [nntrainer_dep],
+  include_directories: nntrainer_test_inc,
+  install: true,
+  install_dir: nntrainer_bindir,
+)
+
 nnstreamer_test_dep = dependency('nnstreamer-test-devel', required: false)
 
 if get_option('enable-nnstreamer-tensor-filter').enabled() and nnstreamer_test_dep.found()
