@@ -13,18 +13,21 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <compute_ops.h>
 #include <cstdint>
 #include <dlfcn.h>
 #include <fstream>
+#include <fused_ffn_layer.h>
+#include <hexagon_repack.h>
 #include <layer_context.h>
 #include <limits>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
-#include <fused_ffn_layer.h>
 #include <quantizer.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#include <unordered_set>
 #include <util_func.h>
 
 namespace causallm {
@@ -92,14 +95,39 @@ static upload_fn get_upload_fn() {
 }
 
 /// Upload a Q4_0 weight to the DSP if not already uploaded (idempotent by key).
+/// The weight data arrives in ARM q4_0x4 layout; the DSP bridge expects
+/// q4x4x2 format, so we must unpack (q4_0x4 → block_q4_0) and repack
+/// (block_q4_0 → q4x4x2) before uploading — same as
+/// HexagonComputeOps::ensure_uploaded.
 static void ensure_weight_uploaded(const void *key, const void *data,
                                    unsigned int N, unsigned int K) {
   static const upload_fn &upload = get_upload_fn();
   if (!upload)
     return;
-  int rc = upload(key, data, N, K);
+
+  static std::unordered_set<const void *> uploaded;
+  if (uploaded.find(key) != uploaded.end())
+    return;
+
+  const size_t nbytes = (size_t)N * ((size_t)K / 32) * 18;
+  static thread_local std::vector<uint8_t> unpack_scratch;
+  static thread_local std::vector<uint8_t> htp_scratch;
+  if (unpack_scratch.size() < nbytes) {
+    unpack_scratch.resize(nbytes);
+    htp_scratch.resize(nbytes);
+  }
+
+  auto *cpu_ops = nntrainer::getComputeOps();
+  cpu_ops->unpack_q4_0(data, unpack_scratch.data(), nbytes, N, K);
+  nntrainer::repack_q4_0_to_htp_q4x4x2(htp_scratch.data(),
+                                       unpack_scratch.data(), nbytes, N, K);
+
+  // Try uploading repacked q4x4x2 data
+  int rc = upload(key, htp_scratch.data(), N, K);
   if (rc != 0) {
     ml_logw("FusedFFN: upload_weight_q4x4x2 failed (rc=%d)", rc);
+  } else {
+    uploaded.insert(key);
   }
 }
 
@@ -168,14 +196,16 @@ static void cpu_ffn_forward(Tensor &input, Tensor &w_gate, Tensor &w_up,
     input.dot(w_up_fp32, up_out, false, true);
   }
 
-  // SwiGLU: gate_out * sigmoid(up_out) → [M,N]
+  // SwiGLU: silu(gate_out) * up_out → [M,N]
+  // silu(x) = x * sigmoid(x)
   Tensor act(TensorDim(1, 1, M, N,
                        TensorDim::TensorType(
                          input.getFormat(),
                          ml::train::TensorDim::DataType::FP32)));
-  up_out.apply(std::function<float(float)>(
-    [](float x) -> float { return 1.0f / (1.0f + std::exp(-x)); }), act);
-  act.multiply_i(gate_out);
+  gate_out.apply(std::function<float(float)>(
+                   [](float x) -> float { return x / (1.0f + std::exp(-x)); }),
+                 act);
+  act.multiply_i(up_out);
 
   // down = act[M,N] · w_down[K_out,N]^T = [M,K_out]  (transpose=true)
   if (to > from) {
@@ -199,6 +229,13 @@ void FusedFFNLayer::finalize(nntrainer::InitLayerContext &context) {
 
   is_cdsp_engine =
     context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP;
+
+  // Fallback: the CausalLM symbolic graph API doesn't always propagate
+  // engine=cdsp to InitLayerContext for custom app layers. If the DSP bridge
+  // is available, assume this layer should dispatch to DSP.
+  if (!is_cdsp_engine && get_ffn_bridge() != nullptr) {
+    is_cdsp_engine = true;
+  }
 
   const auto &hidden_dim = std::get<props::HiddenDim>(ffn_props).get();
   const auto &output_dim = std::get<props::OutputDim>(ffn_props).get();
