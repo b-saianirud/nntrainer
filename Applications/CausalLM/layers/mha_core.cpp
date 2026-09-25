@@ -141,6 +141,142 @@ bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
   return (fn != nullptr);
 }
 
+/**
+ * @brief Batched FP32 SGEMM bridge function type.
+ * Fuses many independent, tightly-packed row-major GEMMs into a single
+ * FastRPC round trip. See nntr_htp_bridge_sgemm_batch_fp32 in
+ * ggml-hexagon's nntr-htp-bridge.cpp for the full contract.
+ */
+using sgemm_batch_fn = int (*)(const float *const *, const float *const *,
+                               float *const *, const unsigned int *,
+                               const unsigned int *, const unsigned int *,
+                               const int *, const int *, unsigned int);
+
+sgemm_batch_fn get_sgemm_batch_bridge() {
+  static sgemm_batch_fn fn = []() -> sgemm_batch_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      ml_logw("MHACore: dlopen(libggml-hexagon.so) failed: %s "
+              "(attention-backward GEMM dispatch disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_sgemm_batch_fp32");
+    if (!s) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_sgemm_batch_fp32) failed: %s "
+              "(attention-backward GEMM dispatch disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    ml_logi("MHACore: sgemm_batch bridge loaded successfully");
+    return reinterpret_cast<sgemm_batch_fn>(s);
+  }();
+  return fn;
+}
+
+/**
+ * @brief Whether attention-backward should dispatch its reformulated GEMMs
+ * to the DSP batch bridge instead of running them on the CPU.
+ *
+ *  - NNTR_HEXAGON_ATTN_BWD=0   force-disable (default: enabled)
+ *  - NNTR_HEXAGON_ATTN_BWD_MIN_TOKENS=<n>  below this seq_len, fall back to
+ *    CPU even if the bridge is available (default 160, mirroring
+ *    NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS - below that the FastRPC round trip
+ *    isn't worth it).
+ */
+bool should_use_attn_bwd_gemm(unsigned int seq_len) {
+  static const bool enabled = [] {
+    const char *v = std::getenv("NNTR_HEXAGON_ATTN_BWD");
+    return !(v && std::string(v) == "0");
+  }();
+  static const unsigned int min_tokens = [] {
+    const char *v = std::getenv("NNTR_HEXAGON_ATTN_BWD_MIN_TOKENS");
+    return v ? static_cast<unsigned int>(std::atoi(v)) : 160u;
+  }();
+
+  if (!enabled)
+    return false;
+  if (seq_len < min_tokens)
+    return false;
+  return get_sgemm_batch_bridge() != nullptr;
+}
+
+/**
+ * @brief One tightly-packed row-major FP32 GEMM: C[M,N] = op(A) @ op(B),
+ * where op(X) is a transpose iff the corresponding trans flag is set. No
+ * lda/ldb/ldc - all three buffers must be tightly packed, matching the
+ * nntr_htp_bridge_sgemm_(batch_)fp32 contract exactly so the two executors
+ * are drop-in interchangeable.
+ */
+struct GemmDesc {
+  const float *A;
+  const float *B;
+  float *C;
+  unsigned int M, N, K;
+  int transA, transB;
+};
+
+/**
+ * @brief Plain triple-loop CPU implementation of the same contract as
+ * nntr_htp_bridge_sgemm_fp32, used as the fallback executor for
+ * run_batched_gemm() (and hence also as the only executor exercised by
+ * host-side unit tests, which have no DSP to dlopen).
+ */
+void cpu_sgemm_fp32(const float *A, const float *B, float *C, unsigned int M,
+                    unsigned int N, unsigned int K, int transA, int transB) {
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      float sum = 0.0f;
+      for (unsigned int k = 0; k < K; ++k) {
+        const float a = transA ? A[k * M + m] : A[m * K + k];
+        const float b = transB ? B[n * K + k] : B[k * N + n];
+        sum += a * b;
+      }
+      C[m * N + n] = sum;
+    }
+  }
+}
+
+/**
+ * @brief Runs a batch of independent GEMMs, dispatching the whole batch to
+ * the DSP in a single FastRPC round trip when available and worthwhile
+ * (should_use_attn_bwd_gemm), falling back to per-GEMM CPU execution
+ * otherwise (including whenever the DSP call itself fails).
+ */
+void run_batched_gemm(std::vector<GemmDesc> &descs, unsigned int seq_len) {
+  if (descs.empty())
+    return;
+
+  if (should_use_attn_bwd_gemm(seq_len)) {
+    const sgemm_batch_fn &fn = get_sgemm_batch_bridge();
+    const unsigned int n = descs.size();
+    std::vector<const float *> a_ptrs(n), b_ptrs(n);
+    std::vector<float *> c_ptrs(n);
+    std::vector<unsigned int> ms(n), ns(n), ks(n);
+    std::vector<int> tas(n), tbs(n);
+    for (unsigned int i = 0; i < n; ++i) {
+      a_ptrs[i] = descs[i].A;
+      b_ptrs[i] = descs[i].B;
+      c_ptrs[i] = descs[i].C;
+      ms[i] = descs[i].M;
+      ns[i] = descs[i].N;
+      ks[i] = descs[i].K;
+      tas[i] = descs[i].transA;
+      tbs[i] = descs[i].transB;
+    }
+    int rc = fn(a_ptrs.data(), b_ptrs.data(), c_ptrs.data(), ms.data(),
+                ns.data(), ks.data(), tas.data(), tbs.data(), n);
+    if (rc == 0)
+      return;
+    ml_logw("MHACore: nntr_htp_bridge_sgemm_batch_fp32 failed (rc=%d), "
+            "falling back to CPU for this batch of %u GEMMs",
+            rc, n);
+  }
+
+  for (const auto &d : descs)
+    cpu_sgemm_fp32(d.A, d.B, d.C, d.M, d.N, d.K, d.transA, d.transB);
+}
+
 } // namespace
 
 inline float convert_scalar(uint16_t h) {
@@ -1969,6 +2105,8 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const unsigned int seq_len = dQ.getDim().height();
   const unsigned int gqa_size = num_heads_Q / num_heads_KV;
   const float scale = 1.0f / std::sqrt((float)head_dim);
+  const unsigned int S = seq_len;
+  const unsigned int D = head_dim;
 
   dQ.setZero();
   dK.setZero();
@@ -1981,13 +2119,15 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const ml::train::TensorDim q_dim = train_q.getDim();       // (B,1,max_ts,HQ*D)
   const ml::train::TensorDim k_dim = train_k.getDim();       // (B,1,max_ts,HKV*D)
   const ml::train::TensorDim v_dim = value.getDim();         // (B,1,seq,HKV*D)
-  const ml::train::TensorDim attn_dim = train_attn.getDim(); // (B,HQ,max_ts,max_ts)
+  // (B,HQ,seq,seq): each (batch,head) block is tightly packed [seq,seq],
+  // see updateTensorsByInputDimensions - sized from seq_len, not max_ts.
+  const ml::train::TensorDim attn_dim = train_attn.getDim();
 
   const float *dy_data = dy.getData<float>();
   const float *q_data = train_q.getData<float>();
   const float *k_data = train_k.getData<float>();
   const float *v_data = value.getData<float>();
-  const float *attn_data = train_attn.getData<float>();
+  float *attn_data = train_attn.getData<float>();
   float *dq_data = dQ.getData<float>();
   float *dk_data = dK.getData<float>();
   float *dv_data = dV.getData<float>();
@@ -1996,61 +2136,166 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const size_t q_row_stride = q_dim.width();
   const size_t k_row_stride = k_dim.width();
   const size_t v_row_stride = v_dim.width();
-  const size_t attn_row_stride = attn_dim.width();
 
-  std::vector<float> d_attn(seq_len);
-  std::vector<float> d_score(seq_len);
+  // Gather Q/K/V/dY per-head slices into contiguous scratch buffers (the
+  // bridge GEMMs require tightly-packed [M,K]/[K,N] input, but these
+  // tensors interleave all heads on the width dimension), run the
+  // reformulated attention backward as two batches of GEMMs dispatched
+  // through run_batched_gemm() (DSP when available and worthwhile, CPU
+  // otherwise), then scatter/accumulate the results back.
+  //
+  // Indexing: per-(b,qh) buffers use idx = b * num_heads_Q + qh; per-(b,kv)
+  // buffers use kv_idx = b * num_heads_KV + kv.
+  std::vector<float> q_gather(batch * num_heads_Q * S * D);
+  std::vector<float> dy_gather(batch * num_heads_Q * S * D);
+  std::vector<float> dq_scratch(batch * num_heads_Q * S * D);
+  std::vector<float> dk_partial(batch * num_heads_Q * S * D);
+  std::vector<float> dv_partial(batch * num_heads_Q * S * D);
+  // d_attn (GEMM1 output), overwritten in place with d_score (softmax
+  // backward output) once GEMM1 completes - the two are never live at once.
+  std::vector<float> score(batch * num_heads_Q * S * S);
+
+  std::vector<float> k_gather(batch * num_heads_KV * S * D);
+  std::vector<float> v_gather(batch * num_heads_KV * S * D);
+  std::vector<float> dk_accum(batch * num_heads_KV * S * D, 0.0f);
+  std::vector<float> dv_accum(batch * num_heads_KV * S * D, 0.0f);
+
+  auto gather_head = [](const float *src, float *dst, unsigned int rows,
+                        size_t row_stride, unsigned int head_offset,
+                        unsigned int width) {
+    for (unsigned int r = 0; r < rows; ++r)
+      std::memcpy(dst + r * width, src + r * row_stride + head_offset,
+                  width * sizeof(float));
+  };
+  auto scatter_head = [](const float *src, float *dst, unsigned int rows,
+                         size_t row_stride, unsigned int head_offset,
+                         unsigned int width) {
+    for (unsigned int r = 0; r < rows; ++r)
+      std::memcpy(dst + r * row_stride + head_offset, src + r * width,
+                  width * sizeof(float));
+  };
 
   for (unsigned int b = 0; b < batch; ++b) {
-    const float *dy_b = dy_data + b * dy_dim.getFeatureLen();
-    const float *q_b = q_data + b * q_dim.getFeatureLen();
     const float *k_b = k_data + b * k_dim.getFeatureLen();
     const float *v_b = v_data + b * v_dim.getFeatureLen();
-    const float *attn_b = attn_data + b * attn_dim.getFeatureLen();
-    float *dq_b = dq_data + b * dq_dim.getFeatureLen();
-    float *dk_b = dk_data + b * dk_dim.getFeatureLen();
-    float *dv_b = dv_data + b * dv_dim.getFeatureLen();
+    for (unsigned int kv = 0; kv < num_heads_KV; ++kv) {
+      const unsigned int kv_idx = b * num_heads_KV + kv;
+      gather_head(k_b, k_gather.data() + kv_idx * S * D, S, k_row_stride,
+                  kv * D, D);
+      gather_head(v_b, v_gather.data() + kv_idx * S * D, S, v_row_stride,
+                  kv * D, D);
+    }
+  }
 
+  // Round 1: d_attn[S,S] = dY_h[S,D] @ V_kv[S,D]^T.
+  std::vector<GemmDesc> round1;
+  round1.reserve(batch * num_heads_Q);
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *q_b = q_data + b * q_dim.getFeatureLen();
+    const float *dy_b = dy_data + b * dy_dim.getFeatureLen();
     for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
       const unsigned int kv = qh / gqa_size;
-      const float *attn_h = attn_b + qh * attn_dim.height() * attn_row_stride;
+      const unsigned int idx = b * num_heads_Q + qh;
+      const unsigned int kv_idx = b * num_heads_KV + kv;
+      gather_head(q_b, q_gather.data() + idx * S * D, S, q_row_stride, qh * D,
+                  D);
+      gather_head(dy_b, dy_gather.data() + idx * S * D, S, dy_row_stride,
+                  qh * D, D);
+      round1.push_back({dy_gather.data() + idx * S * D,
+                        v_gather.data() + kv_idx * S * D,
+                        score.data() + idx * S * S, S, S, D, 0, 1});
+    }
+  }
+  run_batched_gemm(round1, S);
 
-      for (unsigned int i = 0; i < seq_len; ++i) {
-        const float *dy_row = dy_b + i * dy_row_stride + qh * head_dim;
-        const float *attn_row = attn_h + i * attn_row_stride;
-        const float *q_row = q_b + i * q_row_stride + qh * head_dim;
+  // Zero-mask the strictly-upper triangle of each (b, qh) attn block
+  // in-place (trainForwarding only ever wrote j <= i; the rest is
+  // uninitialized tensor-pool memory), then softmax backward elementwise,
+  // overwriting `score` (currently d_attn) with d_score * scale in place.
+  // Because attn[i][j] is now 0 for j > i, d_score is automatically 0
+  // there too - no separate causal mask is needed on d_score itself.
+  for (unsigned int b = 0; b < batch; ++b) {
+    float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      float *attn_h = attn_b + qh * S * S;
+      float *d_attn_h = score.data() + (b * num_heads_Q + qh) * S * S;
 
-        float dot_sum = 0.0f; // sum_j attn[i][j] * d_attn[i][j]
-        for (unsigned int j = 0; j <= i; ++j) {
-          const float *v_row = v_b + j * v_row_stride + kv * head_dim;
-          float da = 0.0f;
-          for (unsigned int d = 0; d < head_dim; ++d)
-            da += dy_row[d] * v_row[d];
-          d_attn[j] = da;
-          dot_sum += attn_row[j] * da;
+      for (unsigned int i = 0; i < S; ++i) {
+        float *attn_row = attn_h + i * S;
+        float *d_attn_row = d_attn_h + i * S;
+        for (unsigned int j = i + 1; j < S; ++j)
+          attn_row[j] = 0.0f;
 
-          float *dv_row = dv_b + j * v_row_stride + kv * head_dim;
-          float w = attn_row[j];
-          for (unsigned int d = 0; d < head_dim; ++d)
-            dv_row[d] += w * dy_row[d];
-        }
-
-        // softmax backward
+        float dot_sum = 0.0f;
         for (unsigned int j = 0; j <= i; ++j)
-          d_score[j] = attn_row[j] * (d_attn[j] - dot_sum);
+          dot_sum += attn_row[j] * d_attn_row[j];
 
-        float *dq_row = dq_b + i * q_row_stride + qh * head_dim;
-        for (unsigned int j = 0; j <= i; ++j) {
-          const float *k_row = k_b + j * k_row_stride + kv * head_dim;
-          float ds = d_score[j] * scale;
-          for (unsigned int d = 0; d < head_dim; ++d)
-            dq_row[d] += ds * k_row[d];
-
-          float *dk_row = dk_b + j * k_row_stride + kv * head_dim;
-          for (unsigned int d = 0; d < head_dim; ++d)
-            dk_row[d] += ds * q_row[d];
-        }
+        for (unsigned int j = 0; j < S; ++j)
+          d_attn_row[j] = attn_row[j] * (d_attn_row[j] - dot_sum) * scale;
       }
+    }
+  }
+
+  // Round 2: dQ_h = d_score @ K_kv; dK_partial_h = d_score^T @ Q_h;
+  // dV_partial_h = attn_masked^T @ dY_h.
+  std::vector<GemmDesc> round2;
+  round2.reserve(batch * num_heads_Q * 3);
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      const unsigned int kv = qh / gqa_size;
+      const unsigned int idx = b * num_heads_Q + qh;
+      const unsigned int kv_idx = b * num_heads_KV + kv;
+      const float *attn_h = attn_b + qh * S * S;
+      const float *d_score_h = score.data() + idx * S * S;
+
+      round2.push_back({d_score_h, k_gather.data() + kv_idx * S * D,
+                        dq_scratch.data() + idx * S * D, S, D, S, 0, 0});
+      round2.push_back({d_score_h, q_gather.data() + idx * S * D,
+                        dk_partial.data() + idx * S * D, S, D, S, 1, 0});
+      round2.push_back({attn_h, dy_gather.data() + idx * S * D,
+                        dv_partial.data() + idx * S * D, S, D, S, 1, 0});
+    }
+  }
+  run_batched_gemm(round2, S);
+
+  // Scatter dQ directly (disjoint per-Q-head output, no accumulation);
+  // accumulate dK/dV partials across each KV-head's gqa_size Q-heads before
+  // scattering.
+  for (unsigned int b = 0; b < batch; ++b) {
+    float *dq_b = dq_data + b * dq_dim.getFeatureLen();
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      const unsigned int idx = b * num_heads_Q + qh;
+      scatter_head(dq_scratch.data() + idx * S * D, dq_b, S, q_row_stride,
+                   qh * D, D);
+    }
+  }
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      const unsigned int kv = qh / gqa_size;
+      const unsigned int idx = b * num_heads_Q + qh;
+      const unsigned int kv_idx = b * num_heads_KV + kv;
+      float *dk_acc = dk_accum.data() + kv_idx * S * D;
+      float *dv_acc = dv_accum.data() + kv_idx * S * D;
+      const float *dk_p = dk_partial.data() + idx * S * D;
+      const float *dv_p = dv_partial.data() + idx * S * D;
+      for (unsigned int i = 0; i < S * D; ++i) {
+        dk_acc[i] += dk_p[i];
+        dv_acc[i] += dv_p[i];
+      }
+    }
+  }
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    float *dk_b = dk_data + b * dk_dim.getFeatureLen();
+    float *dv_b = dv_data + b * dv_dim.getFeatureLen();
+    for (unsigned int kv = 0; kv < num_heads_KV; ++kv) {
+      const unsigned int kv_idx = b * num_heads_KV + kv;
+      scatter_head(dk_accum.data() + kv_idx * S * D, dk_b, S, k_row_stride,
+                   kv * D, D);
+      scatter_head(dv_accum.data() + kv_idx * S * D, dv_b, S, v_row_stride,
+                   kv * D, D);
     }
   }
 
