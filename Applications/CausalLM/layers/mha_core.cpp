@@ -13,11 +13,15 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 static std::mutex rope_init_mtx;
@@ -26,11 +30,118 @@ static std::mutex rope_init_mtx;
 #include <layer_context.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
 #include <util_func.h>
 
 #include <cstdint>
+
+namespace {
+
+/**
+ * @brief Flash attention bridge function type.
+ * Dispatches Q/K/V/mask to DSP via nntr_htp_bridge_flash_attn.
+ */
+using flash_attn_fn = int (*)(const void *, const void *, const void *,
+                              const void *, void *, unsigned int, unsigned int,
+                              unsigned int, unsigned int, unsigned int, float,
+                              int, int);
+
+flash_attn_fn get_flash_attn_bridge() {
+  static flash_attn_fn fn = []() -> flash_attn_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      ml_logw("MHACore: dlopen(libggml-hexagon.so) failed: %s "
+              "(flash attention disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_flash_attn");
+    if (!s) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_flash_attn) failed: %s "
+              "(flash attention disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    ml_logi("MHACore: flash attention bridge loaded successfully");
+    return reinterpret_cast<flash_attn_fn>(s);
+  }();
+  return fn;
+}
+
+/**
+ * @brief Build causal mask for flash attention.
+ * mask[i][j] = 0 if j < cache_from + i + 1, else -INF (0xFC00).
+ * Layout: [n_tokens, n_kv] F16, row-major.
+ */
+void build_causal_mask(std::vector<uint16_t> &mask, unsigned int n_tokens,
+                       unsigned int n_kv, unsigned int cache_from) {
+  mask.resize(n_tokens * n_kv);
+  for (unsigned int i = 0; i < n_tokens; ++i) {
+    const unsigned int valid_to = cache_from + i + 1;
+    for (unsigned int j = 0; j < n_kv; ++j) {
+      mask[i * n_kv + j] = (j < valid_to) ? 0x0000 : 0xFC00;
+    }
+  }
+}
+
+// Causal mask cache: key = (cache_from << 40) | (n_kv << 20) | n_tokens
+static std::unordered_map<uint64_t, std::vector<uint16_t>> g_causal_mask_cache;
+
+const std::vector<uint16_t> &get_cached_causal_mask(unsigned int n_tokens,
+                                                    unsigned int n_kv,
+                                                    unsigned int cache_from) {
+  uint64_t key =
+    ((uint64_t)cache_from << 40) | ((uint64_t)n_kv << 20) | (uint64_t)n_tokens;
+  auto it = g_causal_mask_cache.find(key);
+  if (it != g_causal_mask_cache.end()) {
+    return it->second;
+  }
+  std::vector<uint16_t> &mask = g_causal_mask_cache[key];
+  build_causal_mask(mask, n_tokens, n_kv, cache_from);
+  return mask;
+}
+
+/**
+ * @brief Check if flash attention should be used.
+ * Enabled for prefill (step_size > 1) with head_dim a multiple of 64
+ * (HMX fast path). The bridge (nntr_htp_bridge_flash_attn) and the DSP
+ * kernel (hmx_flash_attn_ext in flash-attn-ops.c) both require
+ * head_dim % 64 == 0.
+ *
+ * Two env knobs (mirroring the ones this was originally validated with,
+ * see FLASH_ATTN_STATUS.md) let us bisect flash-attn from the rest of the
+ * cdsp path without a rebuild:
+ *  - NNTR_HEXAGON_FLASH_ATTN=0   force-disable (default: enabled)
+ *  - NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS=<n>  below this step_size, fall
+ *    back to the CPU attention path even if the bridge is available
+ *    (default 160 - below that the FastRPC round trip isn't worth it).
+ */
+bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
+                           bool is_prefill) {
+  static const bool enabled = [] {
+    const char *v = std::getenv("NNTR_HEXAGON_FLASH_ATTN");
+    return !(v && std::string(v) == "0");
+  }();
+  static const unsigned int min_tokens = [] {
+    const char *v = std::getenv("NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS");
+    return v ? static_cast<unsigned int>(std::atoi(v)) : 160u;
+  }();
+
+  if (!enabled)
+    return false;
+  if (!is_prefill || step_size <= 1)
+    return false;
+  if (step_size < min_tokens)
+    return false;
+  if (head_dim % 64 != 0)
+    return false;
+  const flash_attn_fn &fn = get_flash_attn_bridge();
+  return (fn != nullptr);
+}
+
+} // namespace
 
 inline float convert_scalar(uint16_t h) {
   return nntrainer::compute_fp16_to_fp32(h);
@@ -812,8 +923,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   unsigned int cache_from = cache_index;
   unsigned int cache_to = cache_from + step_size;
 
+  // batch(1): this is a single batch's windowed view into the cache, not
+  // the whole cache - without resetting it, the requested dim keeps
+  // cache_key_dim's full batch count while the offset only accounts for
+  // one batch slot, so any batch > 0 reads/overflows into other batches'
+  // cache entries.
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.batch(1);
+  cached_value_dim.batch(1);
   cached_key_dim.height(cache_to);
   cached_value_dim.height(cache_to);
 
@@ -831,14 +949,42 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  compute_kcaches(query_step, b_cached_key, out_, cache_from,
-                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+  // Try flash attention dispatch (DSP offload) for prefill
+  bool use_flash = should_use_flash_attn(step_size, head_dim, is_prefill);
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  if (use_flash) {
+    const std::vector<uint16_t> &mask =
+      get_cached_causal_mask(step_size, cache_to, cache_from);
 
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                cache_from, num_heads_KV, gqa_size, head_dim,
-                                cache_to);
+    bool q_is_fp16 =
+      (query_step.getDataType() == ml::train::TensorDim::DataType::FP16);
+    bool out_is_fp16 = (attention_output_step.getDataType() ==
+                        ml::train::TensorDim::DataType::FP16);
+
+    const flash_attn_fn &fn = get_flash_attn_bridge();
+    int rc =
+      fn(query_step.getData(), b_cached_key.getData(), b_cached_value.getData(),
+         mask.data(), attention_output_step.getData(), step_size, num_heads_Q,
+         num_heads_KV, head_dim, cache_to, 1.0f / sqrtf((float)head_dim),
+         q_is_fp16, out_is_fp16);
+
+    if (rc != 0) {
+      ml_logw("MHACore: flash_attn returned %d, falling back to CPU", rc);
+      use_flash = false;
+    }
+  }
+
+  if (!use_flash) {
+    // Original CPU path
+    compute_kcaches(query_step, b_cached_key, out_, cache_from,
+                    cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+
+    softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+
+    compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
+                                  cache_from, num_heads_KV, gqa_size, head_dim,
+                                  cache_to);
+  }
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
@@ -893,8 +1039,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
   }
 
+  // batch(1): see the non-sink overload above for why this is required.
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.batch(1);
+  cached_value_dim.batch(1);
   cached_key_dim.height(to);
   cached_value_dim.height(to);
 
