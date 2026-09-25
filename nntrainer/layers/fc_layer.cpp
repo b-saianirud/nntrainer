@@ -489,8 +489,14 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
+    // input_ and hidden_ (output) generally have different widths (e.g. Q/K/V
+    // projections, up/down/gate projections), so each tensor's per-batch
+    // offset must use its own featureLen. Using hidden_dim's featureLen for
+    // input_ (as before) either overflows input_'s backing memory when
+    // hidden_'s width is larger (thrown by getSharedDataTensor's bounds
+    // check), or silently reads from the wrong offset when it is smaller.
     Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim, b * hidden_dim.getFeatureLen(), true);
+      input_step_dim, b * input_dim.getFeatureLen(), true);
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
