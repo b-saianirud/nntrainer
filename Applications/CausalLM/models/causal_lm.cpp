@@ -109,18 +109,28 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
           .get<unsigned int>();
   }
 
-  if (generation_cfg["eos_token_id"].is_array()) {
+  // generation_config.json is optional (e.g. absent on some on-device
+  // deployments); fall back to config.json's eos/bos ids rather than
+  // indexing a missing key, which would default-construct a JSON null and
+  // blow up on .get<unsigned int>().
+  const bool has_eos = generation_cfg.contains("eos_token_id") &&
+                       !generation_cfg["eos_token_id"].is_null();
+  if (has_eos && generation_cfg["eos_token_id"].is_array()) {
     EOS_TOKEN_ID =
       generation_cfg["eos_token_id"].empty()
         ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
         : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
-  } else {
+  } else if (has_eos) {
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
+  } else {
+    EOS_TOKEN_ID.clear();
+    EOS_TOKEN_ID.push_back(cfg["eos_token_id"].get<unsigned int>());
   }
-  BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
-                   ? cfg["bos_token_id"].get<unsigned int>()
-                   : generation_cfg["bos_token_id"].get<unsigned int>();
+  BOS_TOKEN_ID = (generation_cfg.contains("bos_token_id") &&
+                  !generation_cfg["bos_token_id"].empty())
+                   ? generation_cfg["bos_token_id"].get<unsigned int>()
+                   : cfg["bos_token_id"].get<unsigned int>();
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
             : 20;
@@ -588,12 +598,53 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_len -= 1;
     init_len -= 1;
   } else {
-    const unsigned int prefill_to = prefill_from + input_len;
-    setKVCachePosition(prefill_from);
-    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                          prefill_from, prefill_to, false);
+    // The model's prefill graph has a fixed input width of INIT_SEQ_LEN
+    // tokens (see nntr_config.json's "init_seq_len"): mapExternalTensor()
+    // always wraps the raw input buffer using that static shape, regardless
+    // of how many real tokens are being fed. A single incremental_inference
+    // call spanning the whole prompt therefore silently assumed the input
+    // tensor could hold arbitrarily many tokens and overflowed (via
+    // getSharedDataTensor's bounds check) as soon as the prompt exceeded
+    // INIT_SEQ_LEN. Fix: split the prefill into chunks of at most
+    // INIT_SEQ_LEN tokens, advancing the KV cache position between chunks.
+    //
+    // Each batch row in input_sample is strided by MAX_SEQ_LEN, but the
+    // graph's fixed-size input tensor expects a contiguous batch x
+    // INIT_SEQ_LEN layout starting at offset 0, so each chunk's tokens are
+    // gathered into a scratch buffer before being handed to the model.
+    std::vector<float> chunk_buffer(static_cast<size_t>(BATCH_SIZE) *
+                                    INIT_SEQ_LEN);
+    unsigned int remaining = input_len;
+    unsigned int chunk_start = 0;
+    unsigned int pos = prefill_from;
 
-    // post process of model output
+    while (remaining > 0) {
+      unsigned int chunk_len = std::min(remaining, INIT_SEQ_LEN);
+
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        std::copy(input_sample + static_cast<size_t>(b) * MAX_SEQ_LEN +
+                    chunk_start,
+                  input_sample + static_cast<size_t>(b) * MAX_SEQ_LEN +
+                    chunk_start + chunk_len,
+                  chunk_buffer.begin() + static_cast<size_t>(b) * INIT_SEQ_LEN);
+
+      input[0] = chunk_buffer.data();
+      const unsigned int chunk_to = pos + chunk_len;
+      setKVCachePosition(pos);
+      output = model->incremental_inference(BATCH_SIZE, input, label, chunk_len,
+                                            pos, chunk_to, false);
+
+      remaining -= chunk_len;
+      chunk_start += chunk_len;
+      pos += chunk_len;
+
+      if (remaining > 0) {
+        for (auto &out : output)
+          delete[] out;
+      }
+    }
+
+    // post process of model output (from the final chunk)
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
 
     if (init_len < INIT_SEQ_LEN)
