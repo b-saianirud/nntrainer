@@ -12,15 +12,50 @@
  */
 
 #include <cmath>
-#include <vector>
 #include <cpu_backend.h>
+#include <cstring>
+#include <dlfcn.h>
 #include <iostream>
+#include <vector>
 
 #include "rms_norm.h"
 
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+// ---------------------------------------------------------------------------
+// DSP bridge for RMSNorm: dlopen libggml-hexagon.so and dlsym
+// nntr_htp_bridge_rms_norm, which dispatches a fused normalize+scale op
+// (HTP_OP_RMS_NORM_MUL) to the cDSP in one FastRPC round trip.
+// Same lazy-load pattern as mha_core.cpp's flash_attn bridge.
+// Returns nullptr if the library or symbol is not found (graceful CPU
+// fallback).
+// ---------------------------------------------------------------------------
+using rms_norm_fn = int (*)(const float *, const float *, float *, unsigned int,
+                            unsigned int, float);
+
+static rms_norm_fn get_rms_norm_bridge() {
+  static rms_norm_fn fn = []() -> rms_norm_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      ml_logw("RMSNorm: dlopen(libggml-hexagon.so) failed: %s "
+              "(DSP offload disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_rms_norm");
+    if (!s) {
+      ml_logw("RMSNorm: dlsym(nntr_htp_bridge_rms_norm) failed: %s "
+              "(DSP offload disabled, using CPU path)",
+              dlerror());
+      return nullptr;
+    }
+    ml_logi("RMSNorm: DSP bridge loaded successfully");
+    return reinterpret_cast<rms_norm_fn>(s);
+  }();
+  return fn;
+}
 
 void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
@@ -95,6 +130,7 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 void RMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
                                   unsigned int from, unsigned int to) {
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
+  bool is_prefill = !from || (to - from) > 1;
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
@@ -121,22 +157,43 @@ void RMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       const auto &dim = in_step.getDim();
+      unsigned int M = dim.height();
+      unsigned int W = dim.width();
+
+      // Try DSP bridge first (fused normalize + gamma scale in one op).
+      // Prefill-only: decode is a single row (M=1), all compute, no
+      // amortization for the FastRPC round trip - keep it on CPU.
+      // NNTR_HEXAGON_NO_ELEM_OPS remains as a manual kill-switch.
+      const rms_norm_fn &dsp_fn = get_rms_norm_bridge();
+      bool dsp_done = false;
+      if (is_prefill && dsp_fn &&
+          context.getComputeEngineType() ==
+            ml::train::LayerComputeEngine::CDSP &&
+          gamma.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+          !getenv("NNTR_HEXAGON_NO_ELEM_OPS")) {
+        const float *gamma_ptr = gamma.getData<float>();
+        int rc = dsp_fn(in_step.getData<float>(), gamma_ptr,
+                        out_step.getData<float>(), M, W, epsilon);
+        if (rc == 0) {
+          dsp_done = true;
+        } else {
+          ml_logw("RMSNorm: DSP bridge failed (rc=%d), falling back to CPU",
+                  rc);
+        }
+      }
+
+      if (!dsp_done) {
 #ifdef ENABLE_FP16
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
-        dim.width(), epsilon);
-
-      // DO NOT USE rms_norm_wrt_width_fp16_intrinsic. It causes overflow!
-
-      // nntrainer::rms_norm_wrt_width_fp16_intrinsic(
-      //   in_step.getData<float>(), out_step.getData<float>(), dim.height(),
-      //   dim.width(), epsilon);
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+          in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+          dim.width(), epsilon);
 #else
-
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
-        dim.width(), epsilon);
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+          in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+          dim.width(), epsilon);
 #endif
+      }
+
       // Cache inv_rms per row for calcDerivative()/calcGradient() to read
       // back verbatim -- see the note in finalize() for why this must not
       // be recomputed from the input tensor at backward time instead.
