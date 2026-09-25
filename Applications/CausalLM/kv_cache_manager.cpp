@@ -14,7 +14,102 @@
 
 #include <stdexcept>
 
+#include <dlfcn.h>
+
+#include <cstdint>
+#include <memory>
+
+#include <llm_util.hpp>
+#include <memory_data.h>
+#include <nntrainer_log.h>
+
 namespace causallm {
+
+namespace {
+
+/**
+ * @brief Back the KV cache with rpcmem and register it with the Hexagon cDSP
+ *        bridge, so the DSP can read K/V in place.
+ *
+ * Prerequisite for offloading attention's two matmuls (Q.K^T and scores.V):
+ * those read the KV cache, and a DSP kernel cannot dereference an ordinary
+ * host pointer at all (see docs/backend_guide/HEXAGON_NPU_PRIMER.md). The
+ * alternative to this is memcpy-ing K and V into rpcmem per layer per
+ * forward pass (~35 MB per 308-token prefill); allocating the cache in
+ * rpcmem once and registering it is strictly better, since the cache is
+ * allocated once and lives for the whole session.
+ *
+ * Resolved by dlopen/dlsym rather than by linking nntrainer's
+ * HexagonRpcAllocator, deliberately: ENABLE_HEXAGON_CDSP is not propagated to
+ * the CausalLM build (it lives only in nntrainer's own Android.mk /
+ * extra_defines), so a compile-time dependency on hexagon_rpc_allocator.h
+ * would break any build of this app against an nntrainer that was configured
+ * without -Denable-hexagon-cdsp=true. Same dlopen pattern already used by
+ * hexagon_compute_ops.cpp and hexagon_rpc_allocator.cpp.
+ *
+ * Returns nullptr if anything is unavailable, in which case the caller keeps
+ * the ordinary host allocation - the CPU attention path stays correct, it
+ * just cannot be offloaded.
+ */
+class KVCacheRpcMem {
+public:
+  static KVCacheRpcMem &global() {
+    static KVCacheRpcMem inst;
+    return inst;
+  }
+
+  bool usable() const { return alloc_ && register_pool_; }
+
+  /** @brief rpcmem_alloc + register with the bridge; nullptr on any failure */
+  void *allocAndRegister(size_t bytes) {
+    if (!usable()) {
+      return nullptr;
+    }
+    void *p = alloc_(kHeapIdSystem, kDefaultFlags, static_cast<int>(bytes));
+    if (!p) {
+      ml_logw("KVCacheManager: rpcmem_alloc(%zu) failed; KV cache stays on "
+              "host memory (attention cannot be offloaded)",
+              bytes);
+      return nullptr;
+    }
+    if (register_pool_(p, bytes) != 0) {
+      ml_logw("KVCacheManager: bridge rejected KV cache pool %p (%zu bytes); "
+              "keeping it but the DSP will not see it",
+              p, bytes);
+    }
+    return p;
+  }
+
+private:
+  using AllocFn = void *(*)(int, uint32_t, int);
+  using RegisterFn = int (*)(const void *, size_t);
+
+  static constexpr int kHeapIdSystem = 25;
+  static constexpr int kDefaultFlags = 1;
+
+  KVCacheRpcMem() {
+    void *rpc = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!rpc) {
+      ml_logw("KVCacheManager: dlopen(libcdsprpc.so) failed: %s", dlerror());
+      return;
+    }
+    alloc_ = reinterpret_cast<AllocFn>(dlsym(rpc, "rpcmem_alloc"));
+
+    void *bridge = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!bridge) {
+      ml_logw("KVCacheManager: dlopen(libggml-hexagon.so) failed: %s",
+              dlerror());
+      return;
+    }
+    register_pool_ = reinterpret_cast<RegisterFn>(
+      dlsym(bridge, "nntr_htp_bridge_register_activation_pool"));
+  }
+
+  AllocFn alloc_ = nullptr;
+  RegisterFn register_pool_ = nullptr;
+};
+
+} // namespace
 
 void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
@@ -62,12 +157,71 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   format_ = format;
   cache_pos_ = 0;
 
+  // Back the cache with rpcmem only when the cDSP engine is actually in use,
+  // so a plain CPU run does not consume the (scarce) rpcmem/CMA pool for no
+  // reason. Falls back to ordinary host allocation whenever unavailable.
+  const bool use_rpcmem = useHexagonCdsp() && KVCacheRpcMem::global().usable();
+
   layer_caches_.resize(num_layers);
+
+  // ONE rpcmem region for every layer's K and V, sub-allocated by offset -
+  // deliberately not one allocation per tensor. HTP_OP_MAX_BUFS and
+  // HTP_MAX_MMAPS are both 16 (S2 finding 9), so 2*num_layers separate
+  // registrations is the exact anti-pattern S8's pooled weight arenas exist
+  // to avoid: it burns a DSP mapping-cache slot per tensor and a
+  // fastrpc_mmap per tensor. The bridge's find_ext_pool() matches any pointer
+  // *inside* a registered range and add_tensor derives its wire offset as
+  // (data - sbuf->base), so sub-allocated pointers need no extra registration.
+  std::shared_ptr<nntrainer::MemoryData> pool;
+  std::vector<size_t> k_off(num_layers), v_off(num_layers);
+  if (use_rpcmem) {
+    const size_t elem_sz =
+      ml::train::TensorDim({1, 1, 1, 1}, {format, dtype}).getDataTypeSize();
+    // 128-byte (HVX) alignment between sub-allocations, expressed in elements.
+    const size_t align_elems = elem_sz ? (128 / elem_sz) : 1;
+    auto round_up = [align_elems](size_t n) {
+      return align_elems ? ((n + align_elems - 1) / align_elems) * align_elems
+                         : n;
+    };
+
+    size_t total_elems = 0;
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      const size_t per =
+        round_up(static_cast<size_t>(batch_size) * max_seq_len * kv_widths_[i]);
+      k_off[i] = total_elems;
+      total_elems += per;
+      v_off[i] = total_elems;
+      total_elems += per;
+    }
+
+    if (void *base =
+          KVCacheRpcMem::global().allocAndRegister(total_elems * elem_sz)) {
+      pool = std::make_shared<nntrainer::MemoryData>(base);
+      ml_logi("KVCacheManager: KV cache in rpcmem, one %zu MiB pool for %u "
+              "layers (DSP-visible)",
+              (total_elems * elem_sz) / (1024 * 1024), num_layers);
+    } else {
+      ml_logw("KVCacheManager: falling back to host memory for the KV cache; "
+              "attention cannot be offloaded to the cDSP");
+    }
+  }
+
   for (unsigned int i = 0; i < num_layers; ++i) {
     ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
                                    {format, dtype});
-    layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
-    layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+
+    if (pool) {
+      // alloc_now=false: the buffer comes from setData below, so do not let
+      // the Tensor allocate host memory it would then leak. offset is in
+      // elements, not bytes (see FloatTensor::getData).
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].key_cache.setData(pool, k_off[i], /*init=*/true);
+      layer_caches_[i].value_cache.setData(pool, v_off[i], /*init=*/true);
+    } else {
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+    }
   }
 }
 
