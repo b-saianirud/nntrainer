@@ -164,6 +164,19 @@ static TensorDim inferOutputDim(const std::shared_ptr<Layer> &layer,
     }
   }
 
+  // Fused FFN: output = {batch, 1, 1, unit} (same as FC, unit = dim)
+  if (layer_type == "fused_ffn") {
+    try {
+      std::string unit_str = layer->getProperty("unit");
+      if (!unit_str.empty()) {
+        unsigned int unit = static_cast<unsigned int>(std::stoul(unit_str));
+        return TensorDim({in_dim.batch(), 1, 1, unit});
+      }
+    } catch (...) {
+      // Fall through to default
+    }
+  }
+
   // Most layers preserve shape (activation, normalization, dropout, etc.)
   return in_dim;
 }
