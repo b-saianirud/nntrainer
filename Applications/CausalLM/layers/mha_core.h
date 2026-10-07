@@ -403,13 +403,24 @@ private:
     train_q_roped,
     train_k_roped,
     train_attn_wt,
+    /** private copy of V: the VALUE input of this layer is not kept alive
+     *  until calcDerivative() (the layer is weightless/frozen) */
+    train_v,
   };
-  std::array<unsigned int, 10> tensor_idx;
+  std::array<unsigned int, 11> tensor_idx;
   unsigned int sink_idx;
 
   /** whether the training-only tensors above were requested (only true when
    *  !use_external_cache and the graph was compiled for TRAIN) */
   bool train_tensors_requested = false;
+
+  /** whether the most recent trainForwarding() call dispatched attention
+   *  through the DSP flash-attention bridge instead of the CPU path. Flash
+   *  attention never materializes the [S,S] softmax matrix, so train_attn_wt
+   *  is left unpopulated whenever this is true - calcDerivative() reads this
+   *  flag to decide whether it must recompute the attention weights from
+   *  train_q_roped/train_k_roped instead of reading them out of the cache. */
+  bool last_forward_used_flash = false;
 
   /** whether the internal KV cache tensors were requested (only true when
    *  !use_external_cache and the graph was NOT compiled for TRAIN; training

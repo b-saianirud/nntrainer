@@ -69,6 +69,22 @@ static std::string withKey(const std::string &key,
 }
 
 /**
+ * @brief Mutable override for useHexagonCdsp(), checked in addition to the
+ * NNTR_USE_HEXAGON_CDSP env var. Lets a caller build a graph that never runs
+ * forwarding (e.g. a throwaway graph used only to load/copy weight tensors)
+ * without engine=cdsp, so it never allocates its own Hexagon-backed
+ * activation pool. That pool would be pure waste (no GEMM ever runs on such a
+ * graph) and, worse, freeing it while the real graph's pinned/eager-mapped
+ * pool is still live can hand the freed pool's fd back to a later,
+ * differently-sized allocation - see HexagonRpcAllocator/nntr-htp-bridge's
+ * pinned-pool contract.
+ */
+inline bool &hexagonCdspTaggingSuppressed() {
+  static bool suppressed = false;
+  return suppressed;
+}
+
+/**
  * @brief Whether Q4_0 FC layers should be tagged engine=cdsp, so they
  * dispatch their GEMM through HexagonComputeOps (see
  * nntrainer/hexagon/hexagon_context.cpp) instead of the CPU NEON/AVX path.
@@ -80,7 +96,7 @@ static std::string withKey(const std::string &key,
  */
 inline bool useHexagonCdsp() {
   static const bool use_cdsp = std::getenv("NNTR_USE_HEXAGON_CDSP") != nullptr;
-  return use_cdsp;
+  return use_cdsp && !hexagonCdspTaggingSuppressed();
 }
 
 /**

@@ -43,7 +43,7 @@ public:
    * @brief Construct a new custom RMS normalization layer object
    *
    */
-  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0, 0}) {}
+  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0, 0, 0}) {}
 
   /**
    * @brief Destroy the custom RMS normalization layer object
@@ -132,7 +132,7 @@ public:
   inline static const std::string type = "rms_norm";
 
 private:
-  std::array<unsigned int, 2> wt_idx;
+  std::array<unsigned int, 3> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              nntrainer::props::SkipPrefill>
     rms_props;

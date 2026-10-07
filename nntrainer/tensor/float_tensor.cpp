@@ -26,6 +26,12 @@
 
 #include <compute_ops.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <typeinfo>
+
 namespace nntrainer {
 
 FloatTensor::FloatTensor(std::string name_, Tformat fm) :
@@ -897,6 +903,27 @@ Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
   }
   /// case others: use gemm
   else {
+    // NNTR_SGEMM_STATS=1: dump a per-(ops, shape) call histogram at exit
+    static const bool stats_on = std::getenv("NNTR_SGEMM_STATS") != nullptr;
+    if (stats_on) {
+      struct Stats {
+        std::mutex m;
+        std::map<std::string, unsigned long> h;
+        ~Stats() {
+          for (auto &kv : h)
+            fprintf(stderr, "SGEMMSTAT %8lu %s\n", kv.second, kv.first.c_str());
+        }
+      };
+      static Stats st;
+      char key[256];
+      snprintf(key, sizeof(key), "%s M=%u N=%u K=%u tA=%d tB=%d beta=%g",
+               typeid(*o).name(), M, N, K, (int)trans, (int)trans_in, beta);
+      static const bool trace_each = std::getenv("NNTR_SGEMM_TRACE") != nullptr;
+      if (trace_each)
+        fprintf(stderr, "SGEMMCALL %s\n", key);
+      std::lock_guard<std::mutex> lk(st.m);
+      ++st.h[key];
+    }
     o->sgemm_fp32((unsigned int)dim.getStorageOrder(), trans, trans_in, M, N, K,
                   alpha, data, lda, mdata, ldb, beta, rdata, ldc);
   }

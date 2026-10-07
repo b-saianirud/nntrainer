@@ -12,6 +12,7 @@
  */
 
 #include <cmath>
+#include <cstring>
 #include <util_simd.h>
 
 #include "swiglu.h"
@@ -36,6 +37,20 @@ void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (!std::get<nntrainer::props::SkipPrefill>(swiglu_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(swiglu_props).get();
+
+  cache_inputs =
+    (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN);
+  if (cache_inputs) {
+    nntrainer::TensorDim cache_dim(context.getInputDimensions()[0]);
+    cache_dim.setTensorType(
+      {context.getFormat(), nntrainer::TensorDim::DataType::FP32});
+    cache_idx[0] = context.requestTensor(
+      cache_dim, "gate_cache", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+    cache_idx[1] = context.requestTensor(
+      cache_dim, "up_cache", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  }
 }
 
 void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
@@ -71,6 +86,22 @@ void SwiGLULayer::computeSwiGLU(nntrainer::RunLayerContext &context,
                             in1.getData<float>() + in1.getIndex(b, c, h, 0),
                             in2.getData<float>() + in2.getIndex(b, c, h, 0));
         }
+        if (cache_inputs) {
+          // keep a private copy of gate/up for calcDerivative(); see
+          // cache_inputs in swiglu.h.
+          nntrainer::Tensor &gate_cache = context.getTensor(cache_idx[0]);
+          nntrainer::Tensor &up_cache = context.getTensor(cache_idx[1]);
+          for (unsigned int h = 0; h < iter; h++) {
+            std::memcpy(gate_cache.getData<float>() +
+                          gate_cache.getIndex(b, c, h, 0),
+                        in1.getData<float>() + in1.getIndex(b, c, h, 0),
+                        sizeof(float) * in1.width());
+            std::memcpy(up_cache.getData<float>() +
+                          up_cache.getIndex(b, c, h, 0),
+                        in2.getData<float>() + in2.getIndex(b, c, h, 0),
+                        sizeof(float) * in2.width());
+          }
+        }
       }
     }
   } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -105,6 +136,22 @@ void SwiGLULayer::updateTensorsByInputDimensions(
   context.updateInput(INPUT_IDX_1, input_dim1);
   context.updateInput(INPUT_IDX_2, input_dim2);
   context.updateOutput(OUT_IDX, output_dim);
+
+  if (cache_inputs) {
+    nntrainer::TensorDim cache_dim = input_dim1;
+    cache_dim.setTensorType(
+      {input_dim1.getFormat(), nntrainer::TensorDim::DataType::FP32});
+    context.updateTensor(cache_idx[0], cache_dim);
+    context.updateTensor(cache_idx[1], cache_dim);
+  }
+}
+
+void SwiGLULayer::setBatch(nntrainer::RunLayerContext &context,
+                           unsigned int batch) {
+  if (cache_inputs) {
+    context.updateTensor(cache_idx[0], batch);
+    context.updateTensor(cache_idx[1], batch);
+  }
 }
 
 /**
@@ -125,8 +172,10 @@ void SwiGLULayer::updateTensorsByInputDimensions(
  *       before it is used to form d_gate[i].
  */
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  nntrainer::Tensor &gate = context.getInput(INPUT_IDX_1);
-  nntrainer::Tensor &up = context.getInput(INPUT_IDX_2);
+  // gate/up come from the private caches filled in forwarding(): the input
+  // buffers of this weightless layer are not guaranteed to be alive here.
+  nntrainer::Tensor &gate = context.getTensor(cache_idx[0]);
+  nntrainer::Tensor &up = context.getTensor(cache_idx[1]);
   const nntrainer::Tensor &dy = context.getIncomingDerivative(OUT_IDX);
   nntrainer::Tensor &d_gate = context.getOutgoingDerivative(INPUT_IDX_1);
   nntrainer::Tensor &d_up = context.getOutgoingDerivative(INPUT_IDX_2);

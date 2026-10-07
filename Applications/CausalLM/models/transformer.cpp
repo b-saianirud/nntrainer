@@ -399,9 +399,21 @@ void Transformer::load_weight_lora(const std::string &base_path,
   LORA_RANK = 0;
   FOR_TRAINING = false;
 
+  // This throwaway graph never calls forwarding()/inference() - it exists
+  // only to load() weight data and hand it off via forEachLayer() below - so
+  // it has no use for engine=cdsp. Suppressing the tag here also avoids
+  // spuriously allocating (then, on scope-exit below, freeing) a pinned
+  // Hexagon activation pool for it, which was colliding with the real
+  // training model's own pool (same fd handed back by rpcmem after this
+  // one's free, while the DSP still had the old mapping registered - see
+  // HexagonRpcAllocator).
+  const bool saved_cdsp_suppressed = hexagonCdspTaggingSuppressed();
+  hexagonCdspTaggingSuppressed() = true;
+
   auto restore_graph_flags = [&]() {
     LORA_RANK = saved_lora_rank;
     FOR_TRAINING = saved_for_training;
+    hexagonCdspTaggingSuppressed() = saved_cdsp_suppressed;
   };
 
   ModelHandle base_model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
@@ -1195,7 +1207,7 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::FusedFFNLayer>, "fused_ffn");
 
     try {
-      const auto cdsp_context = static_cast<nntrainer::AppContext *>(
+      const auto cdsp_context = static_cast<nntrainer::HexagonContext *>(
         ct_engine.getRegisteredContext("cdsp"));
       cdsp_context->registerFactory(
         nntrainer::createLayer<causallm::RMSNormLayer>);

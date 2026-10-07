@@ -121,6 +121,10 @@ TEST(CausalLmLoraBackward, RmsNormCalcDerivativeMatchesFiniteDifference) {
   // forwarding() populates it below, calcDerivative() reads it back.
   tensors.emplace_back(nntrainer::TensorDim({1, 1, height, 1}),
                        nntrainer::Initializer::NONE, true, true, "inv_rms");
+  // x cache: finalize() also requests a private copy of the input for
+  // backward (the real graph only keeps the input alive through forwarding()).
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "x_cache");
 
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
@@ -183,6 +187,10 @@ TEST(CausalLmLoraBackward,
   const unsigned int chunks_per_batch = height * width / feature_size;
   tensors.emplace_back(nntrainer::TensorDim({1, 1, chunks_per_batch, 1}),
                        nntrainer::Initializer::NONE, true, true, "inv_rms");
+  // x cache: finalize() also requests a private copy of the input for
+  // backward (the real graph only keeps the input alive through forwarding()).
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "x_cache");
 
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
@@ -243,6 +251,12 @@ TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeMatchesFiniteDifference) {
            inputs[0].getVariableRef().getData<float>());
   std::copy(up, up + height * width,
            inputs[1].getVariableRef().getData<float>());
+
+  // gate/up caches: private copies taken in forwarding() for calcDerivative().
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "gate_cache");
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "up_cache");
 
   auto run_context =
     makeRunContext("swiglu_gradcheck", weights, inputs, outputs, tensors);
@@ -614,6 +628,12 @@ TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeIsSafeWhenGradAliasesInput) {
     outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
                          nntrainer::Initializer::NONE, true, true, "out");
 
+    tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                         nntrainer::Initializer::NONE, true, true,
+                         "gate_cache");
+    tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                         nntrainer::Initializer::NONE, true, true, "up_cache");
+
     auto rc = makeRunContext("swiglu_alias", weights, inputs, outputs, tensors);
     std::copy(dy0.begin(), dy0.end(),
               rc.getOutputGradUnsafe(0).getData<float>());
@@ -661,6 +681,10 @@ TEST(CausalLmLoraBackward, RmsNormCalcGradientMatchesFiniteDifference) {
   // inv_rms cache: see the identical note in the calcDerivative test above.
   tensors.emplace_back(nntrainer::TensorDim({1, 1, height, 1}),
                        nntrainer::Initializer::NONE, true, true, "inv_rms");
+  // x cache: finalize() also requests a private copy of the input for
+  // backward (the real graph only keeps the input alive through forwarding()).
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "x_cache");
 
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
@@ -724,6 +748,10 @@ TEST(CausalLmLoraBackward,
   const unsigned int chunks_per_batch = height * width / feature_size;
   tensors.emplace_back(nntrainer::TensorDim({1, 1, chunks_per_batch, 1}),
                        nntrainer::Initializer::NONE, true, true, "inv_rms");
+  // x cache: finalize() also requests a private copy of the input for
+  // backward (the real graph only keeps the input alive through forwarding()).
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, width}),
+                       nntrainer::Initializer::NONE, true, true, "x_cache");
 
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");

@@ -136,7 +136,7 @@ public:
   inline static const std::string type = "reshaped_rms_norm";
 
 private:
-  std::array<unsigned int, 2> wt_idx;
+  std::array<unsigned int, 3> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              props::FeatureSize, nntrainer::props::SkipPrefill, props::UseGamma>
     rms_props;

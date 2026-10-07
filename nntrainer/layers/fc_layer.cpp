@@ -23,6 +23,7 @@
 
 #include <common_properties.h>
 #include <fc_layer.h>
+#include <fp16.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
 #include <nntrainer_error.h>
@@ -33,6 +34,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 
@@ -357,8 +361,41 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
+  // QLoRA training on the Hexagon cDSP: keep the frozen Q4_0 base weight
+  // resident on the DSP and run Y = X*W^T on HMX. The DSP dequantizes the
+  // weight to FP16 tiles and converts the FP32 activation to FP16 itself, so
+  // there is none of the W4A8 activation quantization noise the CPU Q4_0
+  // kernel has (the reason the CPU branch below dequantizes instead).
+  // HMX results are FP16, though, and a few layers (the massive-activation
+  // ffn_down outputs of Qwen3) exceed its range: if the output saturates or is
+  // non-finite, this layer is flagged and from then on, including this call,
+  // takes the exact CPU path below.
+  bool dsp_done = false;
+  if (!dsp_q4_overflow && quantizer == nullptr &&
+      !std::get<props::LoraRank>(fc_props).empty() &&
+      weight.getDataType() == TensorDim::DataType::Q4_0 &&
+      input_.getDataType() == TensorDim::DataType::FP32 &&
+      hidden_.getDataType() == TensorDim::DataType::FP32 &&
+      context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP) {
+    input_.dot(weight, hidden_, false, false);
+    const float *d = hidden_.getData<float>();
+    const size_t n = hidden_.size();
+    bool bad = false;
+    for (size_t k = 0; k < n && !bad; ++k)
+      bad = !(std::fabs(d[k]) < 65504.0f);
+    if (bad) {
+      dsp_q4_overflow = true;
+      ml_logw("%s: HMX FP16 output overflow, this layer now runs on the CPU",
+              context.getName().c_str());
+    } else {
+      dsp_done = true;
+    }
+  }
+
   ///@todo This dequantization action should be moved to tensor.dot()
-  if (quantizer != nullptr) {
+  if (dsp_done) {
+    // hidden_ already holds the DSP result
+  } else if (quantizer != nullptr) {
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
     input_.dot(weight_, hidden_, false, false);
   } else if (!std::get<props::LoraRank>(fc_props).empty() &&
@@ -376,7 +413,55 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       weight.getDataType() == DT::Q4_0 ? nntrainer::QScheme::Q4_0
                                         : nntrainer::QScheme::Q6_K);
     Tensor w_deq = dq->dequantize(weight, act_dtype);
+    {
+      static bool printed = false;
+      if (!printed && context.getName() == "layer0_wq" &&
+          w_deq.getDataType() == TensorDim::DataType::FP32) {
+        const float *d = w_deq.getData<float>();
+        const size_t n = w_deq.size();
+        for (size_t k = 0; k < n; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            printed = true;
+            fprintf(stderr, "HEXDIAG fc_wdeq layer=%s flatidx=%zu BAD\n",
+                    context.getName().c_str(), k);
+            break;
+          }
+        }
+        if (!printed) {
+          fprintf(stderr, "HEXDIAG fc_wdeq layer=%s CLEAN n=%zu\n",
+                  context.getName().c_str(), n);
+          printed = true;
+        }
+      }
+    }
     input_.dot(w_deq, hidden_, false, false);
+    {
+      static bool printed2 = false;
+      if (!printed2 && context.getName() == "layer0_wq" &&
+          hidden_.getDataType() == TensorDim::DataType::FP32) {
+        const float *d = hidden_.getData<float>();
+        const size_t n = hidden_.size();
+        for (size_t k = 0; k < n; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            printed2 = true;
+            fprintf(stderr, "HEXDIAG fc_hidden layer=%s flatidx=%zu BAD\n",
+                    context.getName().c_str(), k);
+            break;
+          }
+        }
+        if (!printed2) {
+          fprintf(stderr, "HEXDIAG fc_hidden layer=%s CLEAN n=%zu\n",
+                  context.getName().c_str(), n);
+          printed2 = true;
+        }
+      }
+    }
 
   } else {
 
@@ -391,6 +476,35 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     Tensor &loraB = context.getWeight(lora_idx[LORAParams::loraB]);
     Tensor &hidden_tmp_lora = context.getTensor(lora_idx[LORAParams::loraTmp]);
     Tensor &hidden_out_lora = context.getTensor(lora_idx[LORAParams::loraOut]);
+
+    if (context.getName() == "layer0_wq") {
+      static int call_count = 0;
+      if (call_count < 6) {
+        ++call_count;
+        auto scan = [&](const char *label, Tensor &t) {
+          if (t.getDataType() != TensorDim::DataType::FP32)
+            return;
+          const float *d = t.getData<float>();
+          const size_t n = t.size();
+          for (size_t k = 0; k < n; ++k) {
+            uint32_t bits;
+            float v = d[k];
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              fprintf(stderr,
+                      "HEXDIAG %s layer=%s call=%d flatidx=%zu BAD "
+                      "val_bits=0x%08x\n",
+                      label, context.getName().c_str(), call_count, k, bits);
+              return;
+            }
+          }
+          fprintf(stderr, "HEXDIAG %s layer=%s call=%d CLEAN n=%zu\n", label,
+                  context.getName().c_str(), call_count, n);
+        };
+        scan("lora_a", loraA);
+        scan("lora_b", loraB);
+      }
+    }
 
     const bool lora_qat = !std::get<props::LoraQAT>(fc_props).empty() &&
                          std::get<props::LoraQAT>(fc_props).get();
@@ -426,7 +540,68 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       hidden_tmp_lora.dot(loraB, hidden_out_lora, false, false);
     }
     hidden_out_lora.multiply_i(lora_scaling);
+
+    if (context.getName() == "layer0_wq") {
+      static int add_call_count = 0;
+      if (add_call_count < 6) {
+        ++add_call_count;
+        auto scan = [&](const char *label, Tensor &t) {
+          if (t.getDataType() != TensorDim::DataType::FP32)
+            return;
+          const float *d = t.getData<float>();
+          const size_t n = t.size();
+          for (size_t k = 0; k < n; ++k) {
+            uint32_t bits;
+            float v = d[k];
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              fprintf(stderr,
+                      "HEXDIAG %s layer=%s call=%d flatidx=%zu BAD "
+                      "val_bits=0x%08x\n",
+                      label, context.getName().c_str(), add_call_count, k,
+                      bits);
+              return;
+            }
+          }
+          fprintf(stderr, "HEXDIAG %s layer=%s call=%d CLEAN n=%zu\n", label,
+                  context.getName().c_str(), add_call_count, n);
+        };
+        scan("lora_tmp", hidden_tmp_lora);
+        scan("lora_out_prehid", hidden_out_lora);
+        scan("hidden_prelora", hidden_);
+      }
+    }
+
     hidden_.add_i(hidden_out_lora);
+
+    if (context.getName() == "layer0_wq") {
+      static int post_call_count = 0;
+      if (post_call_count < 6) {
+        ++post_call_count;
+        if (hidden_.getDataType() == TensorDim::DataType::FP32) {
+          const float *d = hidden_.getData<float>();
+          const size_t n = hidden_.size();
+          bool bad = false;
+          for (size_t k = 0; k < n; ++k) {
+            uint32_t bits;
+            float v = d[k];
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              fprintf(stderr,
+                      "HEXDIAG hidden_postlora layer=%s call=%d flatidx=%zu "
+                      "BAD val_bits=0x%08x\n",
+                      context.getName().c_str(), post_call_count, k, bits);
+              bad = true;
+              break;
+            }
+          }
+          if (!bad)
+            fprintf(stderr,
+                    "HEXDIAG hidden_postlora layer=%s call=%d CLEAN n=%zu\n",
+                    context.getName().c_str(), post_call_count, n);
+        }
+      }
+    }
   }
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
@@ -541,6 +716,75 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
   const Tensor &derivative_ = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
+  {
+    static bool printed = false;
+    if (!printed && derivative_.getDataType() == TensorDim::DataType::FP32) {
+      const float *d = derivative_.getData<float>();
+      const size_t n = derivative_.size();
+      for (size_t k = 0; k < n; ++k) {
+        uint32_t bits;
+        float v = d[k];
+        std::memcpy(&bits, &v, sizeof(v));
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+          printed = true;
+          fprintf(stderr,
+                  "HEXDIAG fc_derivin_firstbad layer=%s flatidx=%zu BAD "
+                  "val_bits=0x%08x\n",
+                  context.getName().c_str(), k, bits);
+          break;
+        }
+      }
+    }
+  }
+
+  // Hexagon cDSP: dX = dY * W^T on HMX against a resident FP16 copy of the
+  // dequantized base weight (nntrainer's [K_in x N_out] layout is exactly the
+  // DSP's [rows x cols] weight layout for this product, so no transpose is
+  // needed). The LoRA term is added on top as (dY * B^T) * A^T * scaling, which
+  // is the same product as dY * (A*B*scaling)^T without forming the dense
+  // K_in x N_out matrix. Layers whose forward overflowed FP16 stay on CPU.
+  if (!std::get<props::LoraRank>(fc_props).empty() && !dsp_q4_overflow &&
+      quantizer == nullptr && weight.getDataType() == TensorDim::DataType::Q4_0 &&
+      derivative_.getDataType() == TensorDim::DataType::FP32 &&
+      ret_.getDataType() == TensorDim::DataType::FP32 &&
+      (std::get<props::LoraQAT>(fc_props).empty() ||
+       !std::get<props::LoraQAT>(fc_props).get()) &&
+      context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP &&
+      context.getComputeOps() != nullptr &&
+      context.getComputeOps()->supports_gemm_f16w_accel_fp32()) {
+    ComputeOps *ops = context.getComputeOps();
+    const unsigned int M = derivative_.getDim().batch() *
+                           derivative_.getDim().channel() *
+                           derivative_.getDim().height();
+    const unsigned int N_out = derivative_.getDim().width();
+    const unsigned int K_in = ret_.getDim().width();
+
+    std::vector<uint16_t> w16;
+    if (!dsp_w16_uploaded) {
+      auto dq = Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+      Tensor w_deq = dq->dequantize(weight, TensorDim::DataType::FP32);
+      const float *wd = w_deq.getData<float>();
+      w16.resize(static_cast<size_t>(K_in) * N_out);
+      for (size_t i = 0; i < w16.size(); ++i)
+        w16[i] = compute_fp32_to_fp16(wd[i]);
+    }
+    int rc = ops->gemm_f16w_accel_fp32(
+      weight.getData(), dsp_w16_uploaded ? nullptr : w16.data(),
+      derivative_.getData<float>(), ret_.getData<float>(), M, K_in, N_out);
+    if (rc == 0) {
+      dsp_w16_uploaded = true;
+      Tensor &lora_A = context.getWeight(lora_idx[LORAParams::loraA]);
+      Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
+      Tensor tmp = derivative_.dot(lora_B, false, true);
+      Tensor lora_dx = tmp.dot(lora_A, false, true);
+      lora_dx.multiply_i(lora_scaling);
+      ret_.add_i(lora_dx);
+      return;
+    }
+    ml_logw("%s: DSP backward GEMM failed (rc=%d), using the CPU path",
+            context.getName().c_str(), rc);
+  }
+
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     // Backward pass: dL/dx = dy × (W + loraA×loraB)^T
     // Dequantize the frozen base weight to the activation dtype (W4A16).
@@ -643,6 +887,37 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
     input_.dot_deriv_wrt_2(
       djdla, djdtmp, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraA]));
+
+    if (context.getName() == "layer0_wq") {
+      static int call_count = 0;
+      if (call_count < 3) {
+        ++call_count;
+        auto scan = [&](const char *label, Tensor &t) {
+          if (t.getDataType() != TensorDim::DataType::FP32)
+            return;
+          const float *d = t.getData<float>();
+          const size_t n = t.size();
+          for (size_t k = 0; k < n; ++k) {
+            uint32_t bits;
+            float v = d[k];
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              fprintf(stderr,
+                      "HEXDIAG %s layer=%s call=%d flatidx=%zu BAD "
+                      "val_bits=0x%08x\n",
+                      label, context.getName().c_str(), call_count, k, bits);
+              return;
+            }
+          }
+          fprintf(stderr, "HEXDIAG %s layer=%s call=%d CLEAN n=%zu\n", label,
+                  context.getName().c_str(), call_count, n);
+        };
+        scan("djdla", djdla);
+        scan("djdlb", djdlb);
+        scan("derivative_in", const_cast<Tensor &>(derivative_));
+        scan("input_in", input_);
+      }
+    }
   }
 }
 

@@ -134,6 +134,11 @@ void TensorPool::finalize(const MemoryPlanner &planner,
     }
     details->token = 0;
 
+    /** work on a local copy: finalize() can run more than once (e.g.
+     * deallocate/allocate at train() start) and rewriting PERSIST_END_ORDER
+     * in place would drop the extended lifespan on the second pass. */
+    std::vector<unsigned int> exec_order = details->exec_order;
+
     /**
      * 1. create the validity ranges for the all the requested tensors.
      * validity_start/validity_end should be a value in the exec order of the
@@ -141,32 +146,32 @@ void TensorPool::finalize(const MemoryPlanner &planner,
      * this tensor
      */
     unsigned int validity_start = end_order + 1;
-    for (unsigned int idx = 0; idx < details->exec_order.size(); idx++) {
-      if (details->exec_order[idx] >= start_order)
-        validity_start = std::min(validity_start, details->exec_order[idx]);
+    for (unsigned int idx = 0; idx < exec_order.size(); idx++) {
+      if (exec_order[idx] >= start_order)
+        validity_start = std::min(validity_start, exec_order[idx]);
       /** This is to enforce not to reach if the execution order is greater
        * than backwarding end order. e.g., for the input layer, the
        * backwarding is not reached but the exeuction order is assigned.
        * */
-      if (details->exec_order[idx] > old_end_order &&
-          details->exec_order[idx] != PERSIST_END_ORDER) {
-        details->exec_order[idx] = PERSIST_END_ORDER - 1;
+      if (exec_order[idx] > old_end_order &&
+          exec_order[idx] != PERSIST_END_ORDER) {
+        exec_order[idx] = PERSIST_END_ORDER - 1;
       }
     }
     unsigned int validity_end = validity_start;
-    for (unsigned int idx = 0; idx < details->exec_order.size(); idx++) {
-      if (details->exec_order[idx] == PERSIST_END_ORDER) {
+    for (unsigned int idx = 0; idx < exec_order.size(); idx++) {
+      if (exec_order[idx] == PERSIST_END_ORDER) {
         if (!persist_end_order) {
           end_order = end_order + 1;
           persist_end_order = true;
         }
         validity_end = end_order;
-        details->exec_order[idx] = validity_end;
+        exec_order[idx] = validity_end;
         break;
       }
 
-      if (details->exec_order[idx] <= end_order) {
-        validity_end = std::max(validity_end, details->exec_order[idx]);
+      if (exec_order[idx] <= end_order) {
+        validity_end = std::max(validity_end, exec_order[idx]);
       }
     }
     /**
@@ -190,7 +195,7 @@ void TensorPool::finalize(const MemoryPlanner &planner,
      */
     details->token = mem_pool->requestMemory(
       spec.tensor->getMemoryBytes(), validity_start, validity_end + 1,
-      details->exec_order, details->lifespan, spec.is_weight_grad);
+      exec_order, details->lifespan, spec.is_weight_grad);
 #ifdef DEBUG
     if (details->token == 0)
       throw std::runtime_error("Received invalid token from memory pool");

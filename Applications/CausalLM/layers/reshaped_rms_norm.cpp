@@ -12,6 +12,9 @@
  */
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <vector>
 #include <cpu_backend.h>
 #include <reshaped_rms_norm.h>
@@ -67,6 +70,18 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
                                        nntrainer::TensorDim::DataType::FP32));
     wt_idx[RMSParams::inv_rms] = context.requestTensor(
       inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+    /**
+     * @note x cache: this layer is frozen under LoRA, so its input buffer is
+     * only kept alive through forwarding(); backward needs x, so keep a
+     * private copy (see RMSNormLayer's x_cache in rms_norm.cpp).
+     */
+    nntrainer::TensorDim x_dim(dim[0]);
+    x_dim.setTensorType(
+      {context.getFormat(), nntrainer::TensorDim::DataType::FP32});
+    wt_idx[RMSParams::x_cache] = context.requestTensor(
+      x_dim, "x_cache", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::ITERATION_LIFESPAN);
   }
 }
@@ -126,6 +141,27 @@ void ReshapedRMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
     in_step.reshape(step_reshaped_dim);
     out_step.reshape(step_reshaped_dim);
 
+    {
+      static bool printed = false;
+      if (!printed && in_step.getDataType() ==
+                        ml::train::TensorDim::DataType::FP32) {
+        const float *d = in_step.getData<float>();
+        const size_t n = in_step.size();
+        for (size_t k = 0; k < n; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            printed = true;
+            fprintf(stderr,
+                    "HEXDIAG rrn_in layer=%s b=%u flatidx=%zu BAD\n",
+                    context.getName().c_str(), b, k);
+            break;
+          }
+        }
+      }
+    }
+
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       ///@todo rms_norm_wrt_width_something() should be refactored to
       /// nntrainer::Tensor operation.
@@ -164,6 +200,13 @@ void ReshapedRMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
           ms /= feature_size;
           inv_rms_row[c] = 1.0f / std::sqrt(ms + epsilon);
         }
+
+        nntrainer::Tensor &x_cache =
+          context.getTensor(wt_idx[RMSParams::x_cache]);
+        std::memcpy(x_cache.getData<float>() +
+                      b * x_cache.getDim().getFeatureLen() +
+                      from * in_dim.width(),
+                    x_chunk, sizeof(float) * chunks * feature_size);
       }
 #ifdef ENABLE_FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -183,6 +226,27 @@ void ReshapedRMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
         out_step.multiply_i(gamma_cast);
       } else {
         out_step.multiply_i(gamma);
+      }
+    }
+
+    {
+      static bool printed = false;
+      if (!printed && out_step.getDataType() ==
+                        ml::train::TensorDim::DataType::FP32) {
+        const float *d = out_step.getData<float>();
+        const size_t n = out_step.size();
+        for (size_t k = 0; k < n; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            printed = true;
+            fprintf(stderr,
+                    "HEXDIAG rrn_out layer=%s b=%u flatidx=%zu BAD\n",
+                    context.getName().c_str(), b, k);
+            break;
+          }
+        }
       }
     }
 
@@ -208,13 +272,16 @@ void ReshapedRMSNormLayer::updateTensorsByInputDimensions(
     nntrainer::TensorDim inv_rms_dim(input_dimensions[0].batch(), 1,
                                      chunks_per_batch, 1);
     context.updateTensor(wt_idx[RMSParams::inv_rms], inv_rms_dim);
+    context.updateTensor(wt_idx[RMSParams::x_cache], input_dimensions[0]);
   }
 }
 
 void ReshapedRMSNormLayer::setBatch(nntrainer::RunLayerContext &context,
                                     unsigned int batch) {
-  if (cache_inv_rms)
+  if (cache_inv_rms) {
     context.updateTensor(wt_idx[RMSParams::inv_rms], batch);
+    context.updateTensor(wt_idx[RMSParams::x_cache], batch);
+  }
 }
 
 /**
@@ -252,7 +319,8 @@ void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const unsigned int batch = in_dim.batch();
   const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
 
-  const float *x = in.getData<float>();
+  const float *x =
+    context.getTensor(wt_idx[RMSParams::x_cache]).getData<float>();
   const float *dy_ = dy.getData<float>();
   const float *inv_rms_ = inv_rms_cache.getData<float>();
   float *dx_ = dx.getData<float>();
@@ -320,7 +388,8 @@ void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
   const unsigned int batch = in_dim.batch();
   const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
 
-  const float *x = in.getData<float>();
+  const float *x =
+    context.getTensor(wt_idx[RMSParams::x_cache]).getData<float>();
   const float *dy_ = dy.getData<float>();
   const float *inv_rms_ = inv_rms_cache.getData<float>();
 

@@ -96,6 +96,10 @@ using nntr_htp_bridge_sgemm_fn = int (*)(const float *, const float *, float *,
                                          unsigned int, unsigned int,
                                          unsigned int, int, int);
 
+using nntr_htp_bridge_gemm_f16w_fn =
+  int (*)(const void *, const void *, const float *, float *, unsigned int,
+          unsigned int, unsigned int);
+
 using nntr_htp_bridge_sgemm_batch_fn =
   int (*)(const float * const *, const float * const *, float * const *,
           const unsigned int *, const unsigned int *, const unsigned int *,
@@ -110,6 +114,7 @@ struct BridgeApi {
 #endif
   nntr_htp_bridge_sgemm_fn sgemm = nullptr;             /**< FP32 GEMM for training */
   nntr_htp_bridge_sgemm_batch_fn sgemm_batch = nullptr;  /**< Batched FP32 GEMM */
+  nntr_htp_bridge_gemm_f16w_fn gemm_f16w = nullptr;      /**< Resident-FP16-weight GEMM */
 };
 
 
@@ -167,6 +172,8 @@ const BridgeApi &get_bridge_api() {
 
     a.sgemm = reinterpret_cast<nntr_htp_bridge_sgemm_fn>(
       sym_optional("nntr_htp_bridge_sgemm_fp32"));
+    a.gemm_f16w = reinterpret_cast<nntr_htp_bridge_gemm_f16w_fn>(
+      sym_optional("nntr_htp_bridge_gemm_f16w"));
     a.sgemm_batch = reinterpret_cast<nntr_htp_bridge_sgemm_batch_fn>(
       sym_optional("nntr_htp_bridge_sgemm_batch_fp32"));
     if (a.sgemm) {
@@ -331,6 +338,20 @@ public:
   // present in libggml-hexagon.so, we dispatch the simple case (alpha=1,
   // beta=0, no leading-dimension padding) to the DSP. All other cases fall
   // back to CPU, as do any bridge failures.
+  bool supports_gemm_f16w_accel_fp32() const override {
+    const BridgeApi *api = get_locked_bridge_api();
+    return api->gemm_f16w != nullptr;
+  }
+
+  int gemm_f16w_accel_fp32(const void *key, const void *w_f16, const float *A,
+                           float *C, unsigned int M, unsigned int N,
+                           unsigned int K) override {
+    const BridgeApi *api = get_locked_bridge_api();
+    if (!api->gemm_f16w)
+      return -1;
+    return api->gemm_f16w(key, w_f16, A, C, M, N, K);
+  }
+
   void sgemm_fp32(const unsigned int TStorageOrder, bool TransA, bool TransB,
                    const unsigned int M, const unsigned int N,
                    const unsigned int K, const float alpha, const float *A,
@@ -342,7 +363,15 @@ public:
     // The bridge swaps src0/src1 to compensate for the matmul_2d kernel's
     // transposed output write, and physically transposes A/B as needed.
     // We only require alpha=1, beta=0 (the common training case).
-    if (api->sgemm && alpha == 1.0f && beta == 0.0f) {
+    // Skinny GEMMs (LoRA rank-sized N or K) are dispatch-bound and the DSP
+    // MUL_MAT path hangs on them (seen at K=32 even with K zero-padded), so
+    // they stay on the CPU. Override with NNTR_HEXAGON_SGEMM_MIN_DIM.
+    static const unsigned int min_dim = [] {
+      const char *v = std::getenv("NNTR_HEXAGON_SGEMM_MIN_DIM");
+      return v ? static_cast<unsigned int>(std::strtoul(v, nullptr, 10)) : 64u;
+    }();
+    const bool big_enough = M >= min_dim && N >= min_dim && K >= min_dim;
+    if (api->sgemm && big_enough && alpha == 1.0f && beta == 0.0f) {
       bool dims_ok = true;
       if (!TransA && lda != K) dims_ok = false;
       if (TransA && lda != M) dims_ok = false;

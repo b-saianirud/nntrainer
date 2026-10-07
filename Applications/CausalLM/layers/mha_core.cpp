@@ -13,6 +13,7 @@
  */
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -65,6 +66,29 @@ flash_attn_fn get_flash_attn_bridge() {
       return nullptr;
     }
     ml_logi("MHACore: flash attention bridge loaded successfully");
+    return reinterpret_cast<flash_attn_fn>(s);
+  }();
+  return fn;
+}
+
+/**
+ * @brief Training variant of the flash attention bridge: [token][head][dim]
+ * Q/K/V/out with K/V in plain heap memory. Null if libggml-hexagon.so is an
+ * older build without nntr_htp_bridge_flash_attn_tokmajor, in which case
+ * trainForwarding keeps its CPU attention loop.
+ */
+const flash_attn_fn &get_flash_attn_train_bridge() {
+  static const flash_attn_fn fn = []() -> flash_attn_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle)
+      return nullptr;
+    void *s = dlsym(handle, "nntr_htp_bridge_flash_attn_tokmajor");
+    if (!s) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_flash_attn_tokmajor) failed: %s "
+              "(training uses the CPU attention loop)",
+              dlerror());
+      return nullptr;
+    }
     return reinterpret_cast<flash_attn_fn>(s);
   }();
   return fn;
@@ -238,43 +262,64 @@ void cpu_sgemm_fp32(const float *A, const float *B, float *C, unsigned int M,
 }
 
 /**
- * @brief Runs a batch of independent GEMMs, dispatching the whole batch to
- * the DSP in a single FastRPC round trip when available and worthwhile
- * (should_use_attn_bwd_gemm), falling back to per-GEMM CPU execution
- * otherwise (including whenever the DSP call itself fails).
+ * @brief Hard cap on GEMMs per nntr_htp_bridge_sgemm_batch_fp32 FastRPC call
+ * (bridge-side stack-allocated tensor arrays are fixed at 16 - see
+ * nntr_htp_bridge_sgemm_batch_fp32 in nntr-htp-bridge.cpp).
+ */
+constexpr unsigned int kMaxBridgeGemmBatch = 16;
+
+/**
+ * @brief Runs a batch of independent GEMMs, dispatching chunks of up to
+ * kMaxBridgeGemmBatch to the DSP in one FastRPC round trip each when
+ * available and worthwhile (should_use_attn_bwd_gemm), falling back to
+ * per-GEMM CPU execution for any chunk the DSP call fails on (or for
+ * everything, when the DSP path isn't used at all).
  */
 void run_batched_gemm(std::vector<GemmDesc> &descs, unsigned int seq_len) {
   if (descs.empty())
     return;
 
-  if (should_use_attn_bwd_gemm(seq_len)) {
-    const sgemm_batch_fn &fn = get_sgemm_batch_bridge();
-    const unsigned int n = descs.size();
-    std::vector<const float *> a_ptrs(n), b_ptrs(n);
-    std::vector<float *> c_ptrs(n);
-    std::vector<unsigned int> ms(n), ns(n), ks(n);
-    std::vector<int> tas(n), tbs(n);
-    for (unsigned int i = 0; i < n; ++i) {
-      a_ptrs[i] = descs[i].A;
-      b_ptrs[i] = descs[i].B;
-      c_ptrs[i] = descs[i].C;
-      ms[i] = descs[i].M;
-      ns[i] = descs[i].N;
-      ks[i] = descs[i].K;
-      tas[i] = descs[i].transA;
-      tbs[i] = descs[i].transB;
-    }
-    int rc = fn(a_ptrs.data(), b_ptrs.data(), c_ptrs.data(), ms.data(),
-                ns.data(), ks.data(), tas.data(), tbs.data(), n);
-    if (rc == 0)
-      return;
-    ml_logw("MHACore: nntr_htp_bridge_sgemm_batch_fp32 failed (rc=%d), "
-            "falling back to CPU for this batch of %u GEMMs",
-            rc, n);
-  }
+  const sgemm_batch_fn fn =
+    should_use_attn_bwd_gemm(seq_len) ? get_sgemm_batch_bridge() : nullptr;
 
-  for (const auto &d : descs)
-    cpu_sgemm_fp32(d.A, d.B, d.C, d.M, d.N, d.K, d.transA, d.transB);
+  for (unsigned int base = 0; base < descs.size();
+       base += kMaxBridgeGemmBatch) {
+    const unsigned int n =
+      std::min<unsigned int>(kMaxBridgeGemmBatch, descs.size() - base);
+    bool dsp_ok = false;
+    if (fn) {
+      std::vector<const float *> a_ptrs(n), b_ptrs(n);
+      std::vector<float *> c_ptrs(n);
+      std::vector<unsigned int> ms(n), ns(n), ks(n);
+      std::vector<int> tas(n), tbs(n);
+      for (unsigned int i = 0; i < n; ++i) {
+        const GemmDesc &d = descs[base + i];
+        a_ptrs[i] = d.A;
+        b_ptrs[i] = d.B;
+        c_ptrs[i] = d.C;
+        ms[i] = d.M;
+        ns[i] = d.N;
+        ks[i] = d.K;
+        tas[i] = d.transA;
+        tbs[i] = d.transB;
+      }
+      int rc = fn(a_ptrs.data(), b_ptrs.data(), c_ptrs.data(), ms.data(),
+                  ns.data(), ks.data(), tas.data(), tbs.data(), n);
+      if (rc == 0) {
+        dsp_ok = true;
+      } else {
+        ml_logw("MHACore: nntr_htp_bridge_sgemm_batch_fp32 failed (rc=%d), "
+                "falling back to CPU for this chunk of %u GEMMs",
+                rc, n);
+      }
+    }
+    if (!dsp_ok) {
+      for (unsigned int i = 0; i < n; ++i) {
+        const GemmDesc &d = descs[base + i];
+        cpu_sgemm_fp32(d.A, d.B, d.C, d.M, d.N, d.K, d.transA, d.transB);
+      }
+    }
+  }
 }
 
 } // namespace
@@ -544,6 +589,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
         nntrainer::TensorLifespan::ITERATION_LIFESPAN);
       tensor_idx[AttentionParams::train_attn_wt] = context.requestTensor(
         attn_wt_dim, "train_attn_wt", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+      tensor_idx[AttentionParams::train_v] = context.requestTensor(
+        k_roped_dim, "train_v", nntrainer::Initializer::NONE, false,
         nntrainer::TensorLifespan::ITERATION_LIFESPAN);
     }
   }
@@ -1863,6 +1911,7 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
     context.updateTensor(tensor_idx[AttentionParams::train_q_roped], batch);
     context.updateTensor(tensor_idx[AttentionParams::train_k_roped], batch);
     context.updateTensor(tensor_idx[AttentionParams::train_attn_wt], batch);
+    context.updateTensor(tensor_idx[AttentionParams::train_v], batch);
   }
 }
 
@@ -1919,6 +1968,7 @@ void MHACoreLayer::updateTensorsByInputDimensions(
                          k_roped_dim);
     context.updateTensor(tensor_idx[AttentionParams::train_attn_wt],
                          attn_wt_dim);
+    context.updateTensor(tensor_idx[AttentionParams::train_v], k_roped_dim);
   }
 }
 
@@ -1952,6 +2002,33 @@ void MHACoreLayer::trainForwarding(nntrainer::RunLayerContext &context) {
                 std::invalid_argument)
     << "[mha_core] training forward only supports FP32 for now";
 
+  {
+    static bool printed = false;
+    if (!printed) {
+      auto scan = [&](const char *label, nntrainer::Tensor &t) {
+        const float *d = t.getData<float>();
+        const size_t n = t.size();
+        for (size_t k = 0; k < n && !printed; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            printed = true;
+            const auto &td = t.getDim();
+            fprintf(stderr,
+                    "HEXDIAG mha_in layer=%s tensor=%s flatidx=%zu BAD "
+                    "(dim=%zu,%zu,%zu,%zu)\n",
+                    context.getName().c_str(), label, k, td.batch(),
+                    td.channel(), td.height(), td.width());
+          }
+        }
+      };
+      scan("query", query);
+      scan("key", key);
+      scan("value", value);
+    }
+  }
+
   const unsigned int batch = query.getDim().batch();
   const unsigned int seq_len = query.getDim().height();
   const unsigned int gqa_size = num_heads_Q / num_heads_KV;
@@ -1970,6 +2047,15 @@ void MHACoreLayer::trainForwarding(nntrainer::RunLayerContext &context) {
   // itself rather than relying on any in-place mutation of the inputs.
   apply_rotary_emb_tensor_v2(query, train_q, head_dim, 0, false);
   apply_rotary_emb_tensor_v2(key, train_k, head_dim, 0, false);
+
+  // Keep a private copy of V for calcDerivative(): the VALUE input buffer
+  // is only guaranteed alive through forwarding().
+  {
+    nntrainer::Tensor &train_v =
+      context.getTensor(tensor_idx[AttentionParams::train_v]);
+    std::memcpy(train_v.getData<float>(), value.getData<float>(),
+                sizeof(float) * value.size());
+  }
 
   const ml::train::TensorDim q_dim = train_q.getDim();    // (B,1,max_ts,HQ*D)
   const ml::train::TensorDim k_dim = train_k.getDim();    // (B,1,max_ts,HKV*D)
@@ -1991,7 +2077,11 @@ void MHACoreLayer::trainForwarding(nntrainer::RunLayerContext &context) {
 
   std::vector<float> scores(seq_len);
 
-  for (unsigned int b = 0; b < batch; ++b) {
+  // Plain O(S^2) CPU causal attention for one batch element - the original
+  // trainForwarding body, factored out so it can serve both as the only
+  // path (no DSP bridge) and as the exact-correctness fallback when the
+  // flash-attention bridge call below fails partway through a batch.
+  auto cpu_forward_batch = [&](unsigned int b) {
     const float *q_b = q_data + b * q_dim.getFeatureLen();
     const float *k_b = k_data + b * k_dim.getFeatureLen();
     const float *v_b = v_data + b * v_dim.getFeatureLen();
@@ -2036,6 +2126,99 @@ void MHACoreLayer::trainForwarding(nntrainer::RunLayerContext &context) {
           float w = attn_row[j];
           for (unsigned int d = 0; d < head_dim; ++d)
             out_row[d] += w * v_row[d];
+        }
+      }
+    }
+  };
+
+  last_forward_used_flash = false;
+
+  // Training always processes the full sequence in one shot, so it is
+  // "prefill" for should_use_flash_attn()'s purposes - same gate
+  // (NNTR_HEXAGON_FLASH_ATTN / _MIN_TOKENS) as the inference path.
+  if (should_use_flash_attn(seq_len, head_dim, /*is_prefill=*/true) &&
+      get_flash_attn_train_bridge() != nullptr) {
+    const flash_attn_fn &fn = get_flash_attn_train_bridge();
+    // cache_from=0: training has no KV-cache prefix, the whole sequence is
+    // fresh every step.
+    const std::vector<uint16_t> &mask =
+      get_cached_causal_mask(seq_len, seq_len, 0);
+
+    // The bridge wants Q/K/V/out laid out as [token][head][dim] (see
+    // nntr_htp_bridge_flash_attn's doc comment in nntr-htp-bridge.cpp) -
+    // exactly how train_q/train_k/value/output already store them, and the
+    // inference-path call above passes its tensors straight through with no
+    // reshuffling either. train_q's and train_k's *_row_stride is their
+    // max-timestep-sized tensor's width (HQ*D / HKV*D respectively) with no
+    // extra padding, so the first seq_len rows of q_b/k_b are one flat
+    // contiguous block; v_dim's height is exactly seq_len already. So Q and
+    // out can be passed straight through; only K/V need converting from
+    // FP32 to FP16 (the DSP flash-attention kernel always reads K/V as
+    // FP16, matching the inference KV-cache layout, independent of
+    // Q/output dtype) - a flat elementwise convert, no gathering.
+    const size_t kv_elems = (size_t)seq_len * num_heads_KV * head_dim;
+    std::vector<uint16_t> k_gather(kv_elems);
+    std::vector<uint16_t> v_gather(kv_elems);
+
+    bool all_ok = true;
+    for (unsigned int b = 0; b < batch && all_ok; ++b) {
+      const float *q_b = q_data + b * q_dim.getFeatureLen();
+      const float *k_b = k_data + b * k_dim.getFeatureLen();
+      const float *v_b = v_data + b * v_dim.getFeatureLen();
+      float *o_b = out_data + b * o_dim.getFeatureLen();
+
+      for (size_t idx = 0; idx < kv_elems; ++idx) {
+        k_gather[idx] = nntrainer::compute_fp32_to_fp16(k_b[idx]);
+        v_gather[idx] = nntrainer::compute_fp32_to_fp16(v_b[idx]);
+      }
+
+      int rc = fn(q_b, k_gather.data(), v_gather.data(), mask.data(), o_b,
+                  seq_len, num_heads_Q, num_heads_KV, head_dim, seq_len,
+                  scale, /*q_is_fp16=*/0, /*out_is_fp16=*/0);
+      if (rc != 0) {
+        ml_logw("MHACore: trainForwarding flash_attn returned %d (batch %u"
+                " of %u) - falling back to CPU for the whole forward pass",
+                rc, b, batch);
+        all_ok = false;
+      }
+    }
+
+    if (all_ok) {
+      // train_attn_wt is intentionally left unpopulated: flash attention
+      // never materializes the [S,S] softmax matrix. calcDerivative()
+      // checks last_forward_used_flash and recomputes it from
+      // train_q_roped/train_k_roped instead of reading this cache.
+      last_forward_used_flash = true;
+      return;
+    }
+    // Bridge failed partway through a batch: some batches' `output` may
+    // already hold DSP results and none have train_attn_wt populated.
+    // Redo every batch on the CPU path for a fully consistent result.
+  }
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    cpu_forward_batch(b);
+  }
+
+  {
+    static bool printed = false;
+    if (!printed) {
+      for (unsigned int b = 0; b < batch && !printed; ++b) {
+        const float *o_b = out_data + b * o_dim.getFeatureLen();
+        for (unsigned int i = 0; i < seq_len && !printed; ++i) {
+          const float *row = o_b + i * o_row_stride;
+          for (unsigned int k = 0; k < o_row_stride; ++k) {
+            uint32_t bits;
+            float v = row[k];
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              printed = true;
+              fprintf(stderr,
+                      "HEXDIAG mha_out layer=%s b=%u row=%u k=%u BAD\n",
+                      context.getName().c_str(), b, i, k);
+              break;
+            }
+          }
         }
       }
     }
@@ -2098,8 +2281,10 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
     context.getTensor(tensor_idx[AttentionParams::train_k_roped]);
   nntrainer::Tensor &train_attn =
     context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
-  // Snapshot V before dV.setZero() below; see the aliasing note above.
-  const nntrainer::Tensor value = context.getInput(INOUT_INDEX::VALUE).clone();
+  // V comes from the private copy taken in trainForwarding(); the VALUE
+  // input buffer is not guaranteed alive here (and dV may alias it).
+  const nntrainer::Tensor &value =
+    context.getTensor(tensor_idx[AttentionParams::train_v]);
 
   const unsigned int batch = dQ.getDim().batch();
   const unsigned int seq_len = dQ.getDim().height();
@@ -2208,6 +2393,82 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   }
   run_batched_gemm(round1, S);
 
+  if (context.getName() == "layer1_attention") {
+    static bool printed = false;
+    if (!printed) {
+      printed = true;
+      auto minmax = [](const char *label, const float *d, size_t n) {
+        float mn = std::numeric_limits<float>::infinity();
+        float mx = -std::numeric_limits<float>::infinity();
+        for (size_t k = 0; k < n; ++k) {
+          if (d[k] < mn)
+            mn = d[k];
+          if (d[k] > mx)
+            mx = d[k];
+        }
+        fprintf(stderr, "HEXDIAG mag_%s layer1 min=%g max=%g\n", label, mn, mx);
+      };
+      minmax("dy", dy_data, dy.size());
+      minmax("q_gather", q_gather.data(), q_gather.size());
+      minmax("k_gather", k_gather.data(), k_gather.size());
+      minmax("v_gather", v_gather.data(), v_gather.size());
+      minmax("round1_dattn", score.data(), score.size());
+      minmax("train_attn", attn_data, train_attn.size());
+    }
+  }
+
+  // If trainForwarding() dispatched through the flash-attention bridge,
+  // train_attn was never populated (flash attention never materializes the
+  // [S,S] softmax matrix) - reconstruct it here from train_q_roped/
+  // train_k_roped before the masking/softmax-backward step below reads it.
+  // q_gather/k_gather are already fully populated by the loops above.
+  if (last_forward_used_flash) {
+    std::vector<GemmDesc> qk;
+    qk.reserve(batch * num_heads_Q);
+    for (unsigned int b = 0; b < batch; ++b) {
+      float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+      for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+        const unsigned int kv = qh / gqa_size;
+        const unsigned int idx = b * num_heads_Q + qh;
+        const unsigned int kv_idx = b * num_heads_KV + kv;
+        qk.push_back({q_gather.data() + idx * S * D,
+                      k_gather.data() + kv_idx * S * D, attn_b + qh * S * S,
+                      S, S, D, 0, 1});
+      }
+    }
+    run_batched_gemm(qk, S);
+
+    // qk left raw QK^T in attn_data (unscaled, unmasked). Apply scale and a
+    // causal row-softmax in place, same math as trainForwarding's CPU path,
+    // so the result is bit-for-bit what the non-flash path would have
+    // cached here.
+    for (unsigned int b = 0; b < batch; ++b) {
+      float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+      for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+        float *attn_h = attn_b + qh * S * S;
+        for (unsigned int i = 0; i < S; ++i) {
+          float *row = attn_h + i * S;
+          float max_score = -std::numeric_limits<float>::infinity();
+          for (unsigned int j = 0; j <= i; ++j) {
+            row[j] *= scale;
+            if (row[j] > max_score)
+              max_score = row[j];
+          }
+          float sum = 0.0f;
+          for (unsigned int j = 0; j <= i; ++j) {
+            row[j] = std::exp(row[j] - max_score);
+            sum += row[j];
+          }
+          const float inv_sum = 1.0f / sum;
+          for (unsigned int j = 0; j <= i; ++j)
+            row[j] *= inv_sum;
+          for (unsigned int j = i + 1; j < S; ++j)
+            row[j] = 0.0f;
+        }
+      }
+    }
+  }
+
   // Zero-mask the strictly-upper triangle of each (b, qh) attn block
   // in-place (trainForwarding only ever wrote j <= i; the rest is
   // uninitialized tensor-pool memory), then softmax backward elementwise,
@@ -2259,6 +2520,28 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   }
   run_batched_gemm(round2, S);
 
+  if (context.getName() == "layer1_attention") {
+    static bool printed = false;
+    if (!printed) {
+      printed = true;
+      auto minmax = [](const char *label, const float *d, size_t n) {
+        float mn = std::numeric_limits<float>::infinity();
+        float mx = -std::numeric_limits<float>::infinity();
+        for (size_t k = 0; k < n; ++k) {
+          if (d[k] < mn)
+            mn = d[k];
+          if (d[k] > mx)
+            mx = d[k];
+        }
+        fprintf(stderr, "HEXDIAG mag_%s layer1 min=%g max=%g\n", label, mn, mx);
+      };
+      minmax("d_score", score.data(), score.size());
+      minmax("dq_scratch", dq_scratch.data(), dq_scratch.size());
+      minmax("dk_partial", dk_partial.data(), dk_partial.size());
+      minmax("dv_partial", dv_partial.data(), dv_partial.size());
+    }
+  }
+
   // Scatter dQ directly (disjoint per-Q-head output, no accumulation);
   // accumulate dK/dV partials across each KV-head's gqa_size Q-heads before
   // scattering.
@@ -2299,6 +2582,27 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
     }
   }
 
+  if (context.getName() == "layer1_attention") {
+    static bool printed_pre = false;
+    if (!printed_pre) {
+      printed_pre = true;
+      auto minmax = [](const char *label, const float *d, size_t n) {
+        float mn = std::numeric_limits<float>::infinity();
+        float mx = -std::numeric_limits<float>::infinity();
+        for (size_t k = 0; k < n; ++k) {
+          if (d[k] < mn)
+            mn = d[k];
+          if (d[k] > mx)
+            mx = d[k];
+        }
+        fprintf(stderr, "HEXDIAG mag_%s layer1 min=%g max=%g\n", label, mn, mx);
+      };
+      minmax("dQ_prerope", dq_data, dQ.size());
+      minmax("dK_prerope", dk_data, dK.size());
+      minmax("dV_final", dv_data, dV.size());
+    }
+  }
+
   // undo RoPE on dQ, dK (dV needs no inverse rotation: no rotation was
   // applied to V in trainForwarding).
   for (unsigned int b = 0; b < batch; ++b) {
@@ -2306,6 +2610,78 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
                              dq_dim.width(), head_dim, seq_len, 0);
     apply_inverse_rotary_emb(dk_data + b * dk_dim.getFeatureLen(),
                              dk_dim.width(), head_dim, seq_len, 0);
+  }
+
+  if (context.getName() == "layer1_attention") {
+    static bool printed_post = false;
+    if (!printed_post) {
+      printed_post = true;
+      auto minmax = [](const char *label, const float *d, size_t n) {
+        float mn = std::numeric_limits<float>::infinity();
+        float mx = -std::numeric_limits<float>::infinity();
+        for (size_t k = 0; k < n; ++k) {
+          if (d[k] < mn)
+            mn = d[k];
+          if (d[k] > mx)
+            mx = d[k];
+        }
+        fprintf(stderr, "HEXDIAG mag_%s layer1 min=%g max=%g\n", label, mn, mx);
+      };
+      minmax("dQ_postrope", dq_data, dQ.size());
+      minmax("dK_postrope", dk_data, dK.size());
+    }
+  }
+
+  {
+    static bool printed_dy = false;
+    if (!printed_dy) {
+      const float *d = dy_data;
+      const size_t n = dy.size();
+      for (size_t k = 0; k < n; ++k) {
+        uint32_t bits;
+        float v = d[k];
+        std::memcpy(&bits, &v, sizeof(v));
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+          printed_dy = true;
+          fprintf(stderr,
+                  "HEXDIAG bwd_dy_firstbad layer=%s flatidx=%zu BAD "
+                  "val_bits=0x%08x flash=%d\n",
+                  context.getName().c_str(), k, bits,
+                  (int)last_forward_used_flash);
+          break;
+        }
+      }
+    }
+  }
+
+  if (context.getName() == "layer0_attention") {
+    static int call_count = 0;
+    if (call_count < 3) {
+      ++call_count;
+      auto scan = [&](const char *label, const float *d, size_t n) {
+        for (size_t k = 0; k < n; ++k) {
+          uint32_t bits;
+          float v = d[k];
+          std::memcpy(&bits, &v, sizeof(v));
+          if ((bits & 0x7F800000u) == 0x7F800000u) {
+            fprintf(stderr,
+                    "HEXDIAG bwd_%s layer=%s call=%d flatidx=%zu BAD "
+                    "val_bits=0x%08x flash=%d\n",
+                    label, context.getName().c_str(), call_count, k, bits,
+                    (int)last_forward_used_flash);
+            return;
+          }
+        }
+        fprintf(stderr, "HEXDIAG bwd_%s layer=%s call=%d CLEAN n=%zu flash=%d\n",
+                label, context.getName().c_str(), call_count, n,
+                (int)last_forward_used_flash);
+      };
+      scan("dy", dy_data, dy.size());
+      scan("score_dattn", score.data(), score.size());
+      scan("dq", dq_data, dQ.size());
+      scan("dk", dk_data, dK.size());
+      scan("dv", dv_data, dV.size());
+    }
   }
 }
 

@@ -388,6 +388,29 @@ public:
   virtual bool supports_gemm_q4_0_accel_fp16() const { return false; }
 
   /**
+   * @brief Whether this backend can keep an FP16 weight resident on the NPU
+   * and run FP32-activation GEMMs against it (training backward dX = dY * W^T,
+   * where W^T has no Q4_0 packing because Q4_0 blocks run along the other
+   * axis).
+   */
+  virtual bool supports_gemm_f16w_accel_fp32() const { return false; }
+
+  /**
+   * @brief NPU GEMM against a resident FP16 weight.
+   *
+   * Computes C[M,N] = A[M,K] @ W[N,K]^T, W being an FP16 [N rows x K cols]
+   * row-major matrix identified by `key` (stable for the process lifetime).
+   * `w_f16` is read only the first time `key` is seen (upload) and may be null
+   * afterwards. Returns 0 on success, nonzero if the caller must fall back to
+   * the CPU.
+   */
+  virtual int gemm_f16w_accel_fp32(const void *key, const void *w_f16,
+                                   const float *A, float *C, unsigned int M,
+                                   unsigned int N, unsigned int K) {
+    return -1;
+  }
+
+  /**
    * @brief NPU-accelerated Q4_0 GEMM with FP16 activations.
    *
    * Computes C[M,N] = A[M,K] @ B[N,K]^T where A is FP16, B is Q4_0, C is FP16.

@@ -285,12 +285,14 @@ void NetworkGraph::markNodesForBackwarding() {
 }
 
 void NetworkGraph::setBatchSize(unsigned int batch_size) {
-  if (batch_size == this->batch_size)
+  if (batch_size == this->batch_size) {
     return;
+  }
 
   this->batch_size = batch_size;
-  if (!input_list.empty() && getInputDimension()[0].batch() == batch_size)
+  if (!input_list.empty() && getInputDimension()[0].batch() == batch_size) {
     return;
+  }
 
   auto allocated = tensor_manager->isAllocated();
 

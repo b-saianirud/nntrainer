@@ -10,6 +10,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 
 #include "cpu_backend.h"
 #include "fp16.h"
@@ -74,6 +75,33 @@ void Q4_0Utils::dequantizeQ4_0x4(const void *q4_weight_repacked, int N, int K,
   std::vector<uint8_t> q4_weight_out(data_size);
   unpackBlocksQ4_0x4((block_q4_0x4 *)q4_weight_repacked, data_size, N, K,
                      (block_q4_0 *)q4_weight_out.data());
+
+  {
+    static bool printed = false;
+    if (!printed) {
+      const int nblocks = K / QK4_0;
+      const block_q4_0 *blocks =
+        reinterpret_cast<const block_q4_0 *>(q4_weight_out.data());
+      const block_q4_0x4 *src =
+        reinterpret_cast<const block_q4_0x4 *>(q4_weight_repacked);
+      for (int idx = 0; idx < N * nblocks && !printed; ++idx) {
+        uint16_t d = blocks[idx].d;
+        if ((d & 0x7C00u) == 0x7C00u) {
+          printed = true;
+          int row = idx / nblocks;
+          int blk = idx % nblocks;
+          int group = row / 4;
+          int i_in_group = row % 4;
+          const block_q4_0x4 &sb = src[group * nblocks + blk];
+          fprintf(stderr,
+                  "HEXDIAG q4unpack N=%d K=%d row=%d blk=%d unpacked_d=0x%04x "
+                  "src_d[0..3]=0x%04x,0x%04x,0x%04x,0x%04x picked_i=%d\n",
+                  N, K, row, blk, d, sb.d[0], sb.d[1], sb.d[2], sb.d[3],
+                  i_in_group);
+        }
+      }
+    }
+  }
 
   nntrainer::dequantize_row_q4_0((const void *)q4_weight_out.data(),
                                  dequantized_weights, K * N);

@@ -14,6 +14,7 @@
 #ifndef __SWIGLU_LAYER_H__
 #define __SWIGLU_LAYER_H__
 
+#include <array>
 #include <layer_context.h>
 #include <layer_devel.h>
 #include <node_exporter.h>
@@ -104,11 +105,27 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   * @note resizes the private input caches on a batch-size change.
+   */
+  WIN_EXPORT void setBatch(nntrainer::RunLayerContext &context,
+                           unsigned int batch) override;
+
   inline static const std::string type = "swiglu";
 
 private:
   std::tuple<nntrainer::props::SkipPrefill> swiglu_props;
   bool skip_prefill = false;
+  /**
+   * @brief true when finalize() ran under ExecutionMode::TRAIN, in which case
+   *        private copies of gate/up were requested for calcDerivative().
+   *        SwiGLU has no weights, so nntrainer only keeps its input buffers
+   *        alive through forwarding() and the memory planner may reuse them
+   *        before backward runs.
+   */
+  bool cache_inputs = false;
+  std::array<unsigned int, 2> cache_idx = {0, 0};
 
   /**
    * @brief shared elementwise SwiGLU compute used by both forwarding (full

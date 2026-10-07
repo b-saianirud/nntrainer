@@ -1722,7 +1722,17 @@ int NeuralNetwork::train(const std::vector<std::string> &values,
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
 
-  status = allocate(ExecutionMode::TRAIN);
+  // Model::compile(x, y, mode) already allocates the activation pool at this
+  // same TRAIN mode/batch size (see tensor_api_graph.cpp step 5). For a
+  // QNN/cdsp graph that pool is rpcmem-backed and pinned with the DSP (see
+  // reuse_inference_tensor_pool_), so freeing and reallocating it here would
+  // hand the DSP a stale mapping ("buffer mapping failed"). allocateTensors()
+  // alone is a safe no-op if already allocated (see
+  // Manager::allocateTensors), so reuse compile()'s pool instead.
+  if (reuse_inference_tensor_pool_)
+    model_graph.allocateTensors(ExecutionMode::TRAIN);
+  else
+    status = allocate(ExecutionMode::TRAIN);
   NN_RETURN_STATUS();
 
   status =

@@ -11,7 +11,12 @@
  *
  */
 
+#include <algorithm>
+#include <cmath>
 #include <cpu_backend.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <layer_context.h>
 #include <limits>
 #include <nntrainer_error.h>
@@ -300,6 +305,37 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
         context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
       hidden_step.add_i(bias);
     }
+
+    {
+      static bool printed = false;
+      const float *in_data = input_step.getData<float>();
+      const float *logits = hidden_step.getData<float>();
+      const unsigned int hidden_n = input_step.width();
+      const unsigned int vocab_n = hidden_step.width();
+      bool in_bad = false, out_bad = false;
+      float in_min = in_data[0], in_max = in_data[0];
+      float out_min = logits[0], out_max = logits[0];
+      for (unsigned int i = 0; i < hidden_n; ++i) {
+        if (std::isnan(in_data[i]) || std::isinf(in_data[i]))
+          in_bad = true;
+        in_min = std::min(in_min, in_data[i]);
+        in_max = std::max(in_max, in_data[i]);
+      }
+      for (unsigned int v = 0; v < vocab_n; ++v) {
+        if (std::isnan(logits[v]) || std::isinf(logits[v]))
+          out_bad = true;
+        out_min = std::min(out_min, logits[v]);
+        out_max = std::max(out_max, logits[v]);
+      }
+      if ((in_bad || out_bad || !printed)) {
+        printed = true;
+        fprintf(stderr,
+                "HEXDIAG lmhead b=%u read_row=%u in[min=%g max=%g bad=%d] "
+                "logits[min=%g max=%g bad=%d]\n",
+                b, read_row, in_min, in_max, (int)in_bad, out_min, out_max,
+                (int)out_bad);
+      }
+    }
   }
 }
 
@@ -404,6 +440,28 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
+      }
+
+      {
+        static bool printed = false;
+        if (!printed) {
+          const float *d = out_tensor.getData<float>();
+          bool bad = false;
+          for (unsigned int k = 0; k < out_dim; ++k) {
+            float v = d[k];
+            uint32_t bits;
+            std::memcpy(&bits, &v, sizeof(v));
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+              bad = true;
+              break;
+            }
+          }
+          if (bad) {
+            printed = true;
+            fprintf(stderr, "HEXDIAG embed b=%zu i=%zu embed_idx=%u BAD\n", b,
+                    i, embed_idx);
+          }
+        }
       }
     });
 

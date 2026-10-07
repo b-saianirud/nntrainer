@@ -157,6 +157,8 @@ private:
                                                 lora_qat - enable per-block Q4_0 fake-quant
                                                 lora_weight_q4 - store/load adapters as real Q4_0 */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
+  bool dsp_q4_overflow = false; /**< HMX FP16 output saturated once: use CPU */
+  bool dsp_w16_uploaded = false; /**< FP16 copy of W resident on the DSP */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
   bool skip_prefill = false;

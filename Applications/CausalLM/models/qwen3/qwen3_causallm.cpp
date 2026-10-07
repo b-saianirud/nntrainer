@@ -44,7 +44,7 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wq_props);
   else if (LORA_RANK > 0)
     wq_props.push_back(withKey("trainable", "false"));
-  LayerHandle wq(createLayer("fully_connected", wq_props));
+  LayerHandle wq(createLayer("fully_connected", withHexagonEngine(wq_props)));
   Tensor q = wq(query);
 
   // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))). Never a LoRA
@@ -68,7 +68,7 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wk_props);
   else if (LORA_RANK > 0)
     wk_props.push_back(withKey("trainable", "false"));
-  LayerHandle wk(createLayer("fully_connected", wk_props));
+  LayerHandle wk(createLayer("fully_connected", withHexagonEngine(wk_props)));
   Tensor k = wk(key);
 
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
@@ -90,7 +90,7 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wv_props);
   else if (LORA_RANK > 0)
     wv_props.push_back(withKey("trainable", "false"));
-  LayerHandle wv(createLayer("fully_connected", wv_props));
+  LayerHandle wv(createLayer("fully_connected", withHexagonEngine(wv_props)));
   Tensor v = wv(value);
 
   // Attention core layer (frozen: GQA has no learnable weights beyond
@@ -128,7 +128,7 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     appendLoRAProps(wo_props);
   else if (LORA_RANK > 0)
     wo_props.push_back(withKey("trainable", "false"));
-  LayerHandle wo(createLayer("fully_connected", wo_props));
+  LayerHandle wo(createLayer("fully_connected", withHexagonEngine(wo_props)));
   return wo(a);
 }
 
