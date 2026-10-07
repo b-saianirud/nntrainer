@@ -2331,19 +2331,29 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   //
   // Indexing: per-(b,qh) buffers use idx = b * num_heads_Q + qh; per-(b,kv)
   // buffers use kv_idx = b * num_heads_KV + kv.
-  std::vector<float> q_gather(batch * num_heads_Q * S * D);
-  std::vector<float> dy_gather(batch * num_heads_Q * S * D);
-  std::vector<float> dq_scratch(batch * num_heads_Q * S * D);
-  std::vector<float> dk_partial(batch * num_heads_Q * S * D);
-  std::vector<float> dv_partial(batch * num_heads_Q * S * D);
+  // These buffers total ~50 MB per call and calcDerivative runs once per layer
+  // per step, so allocating them fresh made the allocator map and unmap fresh
+  // pages every time (~1.5 GB of page faults per step, over 20% of the process
+  // time in the kernel). Keep them alive across calls and re-zero in place:
+  // same contents the zero-initialized std::vectors had.
+  auto reuse_zeroed = [](size_t slot, size_t n) -> std::vector<float> & {
+    thread_local std::vector<float> bufs[10];
+    bufs[slot].assign(n, 0.0f);
+    return bufs[slot];
+  };
+  auto &q_gather = reuse_zeroed(0, batch * num_heads_Q * S * D);
+  auto &dy_gather = reuse_zeroed(1, batch * num_heads_Q * S * D);
+  auto &dq_scratch = reuse_zeroed(2, batch * num_heads_Q * S * D);
+  auto &dk_partial = reuse_zeroed(3, batch * num_heads_Q * S * D);
+  auto &dv_partial = reuse_zeroed(4, batch * num_heads_Q * S * D);
   // d_attn (GEMM1 output), overwritten in place with d_score (softmax
   // backward output) once GEMM1 completes - the two are never live at once.
-  std::vector<float> score(batch * num_heads_Q * S * S);
+  auto &score = reuse_zeroed(5, batch * num_heads_Q * S * S);
 
-  std::vector<float> k_gather(batch * num_heads_KV * S * D);
-  std::vector<float> v_gather(batch * num_heads_KV * S * D);
-  std::vector<float> dk_accum(batch * num_heads_KV * S * D, 0.0f);
-  std::vector<float> dv_accum(batch * num_heads_KV * S * D, 0.0f);
+  auto &k_gather = reuse_zeroed(6, batch * num_heads_KV * S * D);
+  auto &v_gather = reuse_zeroed(7, batch * num_heads_KV * S * D);
+  auto &dk_accum = reuse_zeroed(8, batch * num_heads_KV * S * D);
+  auto &dv_accum = reuse_zeroed(9, batch * num_heads_KV * S * D);
 
   auto gather_head = [](const float *src, float *dst, unsigned int rows,
                         size_t row_stride, unsigned int head_offset,

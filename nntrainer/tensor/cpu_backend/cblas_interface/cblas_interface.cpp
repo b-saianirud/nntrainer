@@ -17,6 +17,8 @@
 #pragma GCC diagnostic pop
 #include <cblas_interface.h>
 
+#include <cstdlib>
+
 namespace nntrainer {
 
 /**
@@ -25,6 +27,14 @@ namespace nntrainer {
  *                         Otherwise, directly call openblas API.
  */
 void __openblas_set_num_threads(int num_threads) {
+  // NNTR_BLAS_THREADS overrides the build-time BLAS_NUM_THREADS at runtime.
+  if (const char *env = std::getenv("NNTR_BLAS_THREADS")) {
+    const int n = std::atoi(env);
+    if (n > 0) {
+      openblas_set_num_threads(n);
+      return;
+    }
+  }
   if (num_threads < 0) {
   #ifdef BLAS_NUM_THREADS
     openblas_set_num_threads(BLAS_NUM_THREADS);

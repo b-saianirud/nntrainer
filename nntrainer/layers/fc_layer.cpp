@@ -535,11 +535,16 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       }
       input_.dot(a_fq, hidden_tmp_lora, false, false);
       hidden_tmp_lora.dot(b_fq, hidden_out_lora, false, false);
+      hidden_out_lora.multiply_i(lora_scaling);
     } else {
+      // Scale the small [rows x rank] intermediate instead of the full
+      // [rows x out] LoRA output (scalar multiplies go through a per-element
+      // std::function). loraTmp therefore holds scaling * (X*A), which is what
+      // calcGradient expects for non-QAT.
       input_.dot(loraA, hidden_tmp_lora, false, false);
+      hidden_tmp_lora.multiply_i(lora_scaling);
       hidden_tmp_lora.dot(loraB, hidden_out_lora, false, false);
     }
-    hidden_out_lora.multiply_i(lora_scaling);
 
     if (context.getName() == "layer0_wq") {
       static int add_call_count = 0;
@@ -776,9 +781,10 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
       Tensor &lora_A = context.getWeight(lora_idx[LORAParams::loraA]);
       Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
       Tensor tmp = derivative_.dot(lora_B, false, true);
-      Tensor lora_dx = tmp.dot(lora_A, false, true);
-      lora_dx.multiply_i(lora_scaling);
-      ret_.add_i(lora_dx);
+      tmp.multiply_i(lora_scaling);
+      // accumulate into ret_ (beta = 1) instead of building a full-size
+      // temporary and adding it
+      tmp.dot(lora_A, ret_, false, true, 1.0f);
       return;
     }
     ml_logw("%s: DSP backward GEMM failed (rc=%d), using the CPU path",
@@ -865,24 +871,35 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
     Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
     Tensor &loraB = context.getWeight(lora_idx[LORAParams::loraB]);
     Tensor &loraTmp = context.getTensor(lora_idx[LORAParams::loraTmp]);
-    const auto &lora_derivative_ = derivative_.multiply(lora_scaling);
+    const bool lora_qat_grad = !std::get<props::LoraQAT>(fc_props).empty() &&
+                              std::get<props::LoraQAT>(fc_props).get();
+    // Non-QAT: the forward already folded the scaling into loraTmp, so dB
+    // needs no extra factor and the scaling is applied to the small
+    // d(loraTmp) below instead of copying and scaling the full dY.
+    Tensor lora_derivative_scaled;
+    if (lora_qat_grad)
+      lora_derivative_scaled = derivative_.multiply(lora_scaling);
+    const Tensor &lora_derivative_ =
+      lora_qat_grad ? lora_derivative_scaled : derivative_;
 
     loraTmp.dot_deriv_wrt_2(
       djdlb, lora_derivative_, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraB]));
 
-    const bool lora_qat_grad = !std::get<props::LoraQAT>(fc_props).empty() &&
-                              std::get<props::LoraQAT>(fc_props).get();
     if (lora_qat_grad) {
       // Straight-through estimator: dL/d(loraTmp) uses b_fq (the same
       // fake-quantized loraB the forward pass used), not the raw loraB.
       djdtmp.dot_deriv_wrt_1(
         b_fq, lora_derivative_, false, false,
         !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+    } else if (context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp])) {
+      djdtmp.dot_deriv_wrt_1(loraB, lora_derivative_, false, false, false);
+      djdtmp.multiply_i(lora_scaling);
     } else {
-      djdtmp.dot_deriv_wrt_1(
-        loraB, lora_derivative_, false, false,
-        !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+      Tensor dtmp(djdtmp.getDim(), true);
+      dtmp.dot_deriv_wrt_1(loraB, lora_derivative_, false, false, false);
+      dtmp.multiply_i(lora_scaling);
+      djdtmp.add_i(dtmp);
     }
     input_.dot_deriv_wrt_2(
       djdla, djdtmp, false, false,
