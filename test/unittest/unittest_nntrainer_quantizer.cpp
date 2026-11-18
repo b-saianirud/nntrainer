@@ -495,6 +495,81 @@ TEST(nntrainer_Quantizer, ggml_q4_0_01_p) {
   EXPECT_NEAR(mean_squared_error, 0., eps * K * N);
 }
 
+/**
+ * @brief GGMLQuantizer Q4_0 dequantize returns the weight in its original
+ * K x N layout, element by element (not only close in aggregate)
+ */
+TEST(nntrainer_Quantizer, ggml_q4_0_02_p) {
+  nntrainer::init_backend();
+
+  const uint32_t K = 256;
+  const uint32_t N = 96; // K != N so a transposed result cannot pass
+
+  std::vector<float> weight =
+    generate_random_vector<float>(K * N, -0.05f, 0.05f);
+
+  nntrainer::Tensor W_fp32(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  for (uint32_t k = 0; k < K; ++k)
+    for (uint32_t n = 0; n < N; ++n)
+      W_fp32.setValue(0, 0, k, n, weight[k * N + n]);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+  nntrainer::Tensor W_q40 =
+    quantizer->quantize(W_fp32, nntrainer::Tdatatype::Q4_0);
+  nntrainer::Tensor W_deq =
+    quantizer->dequantize(W_q40, nntrainer::Tdatatype::FP32);
+
+  ASSERT_EQ(W_deq.height(), K);
+  ASSERT_EQ(W_deq.width(), N);
+
+  // Q4_0 keeps 16 levels over a block's range: the per-element error is
+  // bounded by one quantization step (max |w| / 8 ~= 0.00625 here).
+  for (uint32_t k = 0; k < K; ++k)
+    for (uint32_t n = 0; n < N; ++n)
+      ASSERT_NEAR(W_deq.getValue(0, 0, k, n), weight[k * N + n], 0.0075f)
+        << "k=" << k << " n=" << n;
+}
+
+/**
+ * @brief a batched FP32 activation (batch > 1) through a Q4_0 weight dot()
+ * computes every batch, not only the first
+ */
+TEST(nntrainer_Quantizer, ggml_q4_0_03_p) {
+  nntrainer::init_backend();
+
+  const uint32_t B = 3, H = 8, K = 128, N = 64;
+
+  nntrainer::Tensor W_fp32(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  W_fp32.setRandNormal(0.0f, 0.05f);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+  nntrainer::Tensor W_q40 =
+    quantizer->quantize(W_fp32, nntrainer::Tdatatype::Q4_0);
+  nntrainer::Tensor W_deq =
+    quantizer->dequantize(W_q40, nntrainer::Tdatatype::FP32);
+
+  nntrainer::Tensor x(B, 1, H, K,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  x.setRandNormal(0.0f, 1.0f);
+
+  nntrainer::Tensor y(B, 1, H, N,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  x.dot(W_q40, y, false, false);
+  nntrainer::Tensor ref = x.dot(W_deq);
+
+  // The Q4_0 kernel quantizes the activation to Q8_0 on the fly, so allow
+  // that noise; a dropped batch would be off by the full signal.
+  for (uint32_t b = 0; b < B; ++b)
+    for (uint32_t h = 0; h < H; ++h)
+      for (uint32_t n = 0; n < N; ++n)
+        ASSERT_NEAR(y.getValue(b, 0, h, n), ref.getValue(b, 0, h, n), 0.25f)
+          << "b=" << b << " h=" << h << " n=" << n;
+}
+
 int main(int argc, char **argv) {
   int result = -1;
 

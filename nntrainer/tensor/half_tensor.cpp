@@ -835,7 +835,7 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   _FP16 *rdata = output.getData<_FP16>();
 
   unsigned int M, N, K;
-  M = getDim().height();
+  M = getDim().batch() * getDim().channel() * getDim().height();
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
   switch (dtype) {
