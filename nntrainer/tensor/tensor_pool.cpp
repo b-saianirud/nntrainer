@@ -161,6 +161,16 @@ void TensorPool::finalize(const MemoryPlanner &planner,
     }
     details->token = 0;
 
+    /** finalize() can run more than once (e.g. deallocate/allocate at train()
+     * start) and the loops below rewrite exec_order in place (PERSIST_END_ORDER
+     * -> validity_end). Restart every pass from the orders as first requested,
+     * or the second pass no longer sees PERSIST_END_ORDER and drops the
+     * extended lifespan. */
+    if (details->requested_exec_order.empty())
+      details->requested_exec_order = details->exec_order;
+    else
+      details->exec_order = details->requested_exec_order;
+
     /**
      * 1. create the validity ranges for the all the requested tensors.
      * validity_start/validity_end should be a value in the exec order of the

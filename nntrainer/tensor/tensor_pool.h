@@ -421,6 +421,10 @@ private:
               ResidencyPlanner::allow_fanout, the lever that restricts the
               device placement to view_count <= 1 so a device run can bisect
               the interaction without a rebuild. */
+    std::vector<unsigned int>
+      requested_exec_order; /**< exec order as first seen by finalize(); every
+                               finalize() pass restarts from this, because the
+                               pass rewrites exec_order in place */
   };
 
   /**

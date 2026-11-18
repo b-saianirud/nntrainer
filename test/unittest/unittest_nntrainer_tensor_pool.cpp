@@ -436,6 +436,31 @@ TEST(TensorPool, validate_memory) {
 }
 
 /**
+ * @brief a PERSIST_END_ORDER tensor keeps its extended lifespan when the pool
+ * is finalized again, e.g. deallocate() + finalize() at the start of train()
+ */
+TEST(TensorPool, finalize_twice_keeps_persist_end_order_p) {
+  constexpr auto ls = nntrainer::TensorLifespan::ITERATION_LIFESPAN;
+  nntrainer::TensorPool pool;
+
+  // `persist` is requested at order 0 and must stay valid past the last
+  // execution order (gradient clipping); `mid` lives only at order 1, so the
+  // two must not share memory.
+  EXPECT_NO_THROW(pool.request("persist", nntrainer::TensorDim({100}),
+                               {0, nntrainer::TensorPool::PERSIST_END_ORDER},
+                               ls));
+  EXPECT_NO_THROW(pool.request("mid", nntrainer::TensorDim({100}), {1}, ls));
+
+  EXPECT_NO_THROW(pool.finalize(nntrainer::OptimizedV1Planner(), 0, 1));
+  const size_t first = pool.size();
+  EXPECT_NO_THROW(pool.deallocate());
+
+  EXPECT_NO_THROW(pool.finalize(nntrainer::OptimizedV1Planner(), 0, 1));
+  EXPECT_EQ(pool.size(), first);
+  EXPECT_EQ(first, 2 * 100 * sizeof(float));
+}
+
+/**
  * @brief qint8 tensors reuse fp32 tensor memory space
  */
 TEST(TensorPool, validate_memory_reuse_01_p) {
