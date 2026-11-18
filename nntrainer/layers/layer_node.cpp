@@ -1066,6 +1066,7 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   // step can tell CPU from GPU consumers at getInput/getOutput. Nothing reads
   // it yet; the default is CPU.
   run_context->setRunComputeEngine(toLayerComputeEngine(compute_engine));
+  run_context->setComputeEngineName(compute_engine);
 }
 
 /**

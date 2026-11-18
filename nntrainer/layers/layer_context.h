@@ -1034,6 +1034,23 @@ public:
     return run_engine;
   }
 
+  /**
+   * @brief  Set the layer's compute engine NAME ("cpu", "gpu", "htp", ...)
+   *         as registered in the Engine, threaded in from
+   *         LayerNode::compute_engine.
+   * @note   Unlike the residency-plane enum above, this identifies the backend
+   *         a layer was tagged for (engine=htp), which layers consult to pick
+   *         an accelerated path.
+   */
+  void setComputeEngineName(const std::string &name) { run_engine_name = name; }
+
+  /**
+   * @brief  Whether this layer was tagged for the engine registered as `name`
+   */
+  bool isComputeEngine(const std::string &name) const {
+    return run_engine_name == name;
+  }
+
 private:
   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
   std::shared_ptr<ContextData> ct_data;
@@ -1043,6 +1060,7 @@ private:
   bool restoreData; /**< reset output for mixed precsion */
   ml::train::LayerComputeEngine run_engine =
     ml::train::LayerComputeEngine::CPU; /**< this layer's compute engine */
+  std::string run_engine_name = "cpu";  /**< registered engine name */
 
   std::vector<Weight *> weights;   /**< weights of the layer */
   std::vector<Var_Grad *> inputs;  /**< inputs of the layer */

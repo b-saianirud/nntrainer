@@ -61,3 +61,16 @@ GTEST_PARAMETER_TEST(LayerImpl, LayerSemantics, ::testing::Values(semantic_tc));
 //   LayerImpl, LayerGoldenTest,
 //   ::testing::Values(
 //     "test") /**< format of type, properties, num_batch, golden file name */);
+
+/**
+ * @brief RunLayerContext reports the engine a layer was tagged for by name
+ */
+TEST(RunLayerContextEngine, engineNameIsTracked) {
+  RunLayerContext context;
+  EXPECT_TRUE(context.isComputeEngine("cpu"));
+  EXPECT_FALSE(context.isComputeEngine("htp"));
+
+  context.setComputeEngineName("htp");
+  EXPECT_TRUE(context.isComputeEngine("htp"));
+  EXPECT_FALSE(context.isComputeEngine("cpu"));
+}
