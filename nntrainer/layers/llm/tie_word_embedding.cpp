@@ -20,8 +20,14 @@
 #include <engine.h>
 #include <env_compat.h>
 #endif
+#include <algorithm>
+#include <cmath>
 #include <cpu_backend.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <layer_context.h>
+#include <limits>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -118,10 +124,27 @@ enum TieWordEmbeddingParams {
   candidate_hidden_step
 };
 
+std::vector<unsigned int> g_tie_embedding_lm_head_read_row;
+
+namespace {
+/**
+ * @brief Look up batch index b's cached read row, falling back to
+ *        `fallback` (the last row) if the cache is empty or doesn't cover
+ *        this batch index -- e.g. inference, which never goes through the
+ *        embedding-mode forwarding() that populates it.
+ */
+inline unsigned int readRowForBatch(unsigned int b, unsigned int fallback) {
+  return (b < g_tie_embedding_lm_head_read_row.size())
+           ? g_tie_embedding_lm_head_read_row[b]
+           : fallback;
+}
+} // namespace
+
 TieWordEmbedding::TieWordEmbedding() :
   LayerImpl(),
   tieword_embedding_props(nntrainer::props::InDim(), nntrainer::props::OutDim(),
-                          nntrainer::props::Unit(), nntrainer::props::Scale()) {
+                          nntrainer::props::Unit(), nntrainer::props::Scale(),
+                          props::FullSequence()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -220,7 +243,9 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
-  output_dims[0].height(1);
+  full_sequence_ = std::get<props::FullSequence>(tieword_embedding_props).get();
+  if (!full_sequence_)
+    output_dims[0].height(1);
 
   // @note The logits keep the ACTIVATION dtype on purpose. This was once
   // forced to FP32 because the caller read the logits unconditionally as
@@ -269,8 +294,137 @@ void TieWordEmbedding::setProperty(const std::vector<std::string> &values) {
   LayerImpl::setProperty(remain_props);
 }
 
+/**
+ * @brief Full-sequence (training) forward.
+ * @details embedding mode processes every token in the sequence (needed to
+ *          build hidden states for the whole prefix). lm_head mode projects
+ *          only a single row (the last real token under right-padded
+ *          training, or the last row of the buffer by default) to vocab
+ *          logits, matching the height=1 output contract already
+ *          established by incremental_forwarding_lmhead. Only the FP32
+ *          weight path is supported here (quantized LoRA/QAT training is a
+ *          later, separate effort).
+ */
 void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
-                                  bool training) {}
+                                  bool training) {
+  if (mode_ == mode::embedding) {
+    nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+    const ml::train::TensorDim input_dim = input_.getDim();
+    const unsigned int seq_len = input_dim.width();
+    const unsigned int b_size = input_dim.batch();
+
+    /**
+     * @note Record which row the lm-head-mode instance should read later in
+     * this same forward pass, per batch index -- different samples in the
+     * same batch pad to different real lengths, so this is not one shared
+     * value. Training right-pads with token id 0, so the last real token is
+     * the last non-zero id; falling back to (seq_len - 1) would read a pad
+     * position and make the model predict from padding. See
+     * g_tie_embedding_lm_head_read_row in the header for why this is
+     * derived here rather than passed in from the data pipeline.
+     *
+     * @note A sample whose final input token is genuinely id 0 would be
+     * under-counted here. The training data generator avoids this by
+     * construction (it pads only after the real tokens), and inference is
+     * unaffected because it never pads.
+     */
+    // Derived on every forwarding() call, not just training ones: validation
+    // also runs the full-sequence forwarding() path (with training=false)
+    // and needs the same read row, otherwise it scores a pad position.
+    // Inference does not come through here at all — it uses
+    // incremental_forwarding(), which derives its own row from (to - from).
+    {
+      g_tie_embedding_lm_head_read_row.assign(b_size, 0);
+      const float *ids = input_.getData<float>();
+      for (unsigned int b = 0; b < b_size; ++b) {
+        const float *ids_b = ids + b * input_dim.getFeatureLen();
+        unsigned int last_real = 0;
+        for (unsigned int i = seq_len; i-- > 0;) {
+          if (static_cast<unsigned int>(ids_b[i]) != 0u) {
+            last_real = i;
+            break;
+          }
+        }
+        g_tie_embedding_lm_head_read_row[b] = last_real;
+      }
+    }
+
+    incremental_forwarding_embedding(context, 0, seq_len, training);
+    return;
+  }
+
+  nntrainer::Tensor weight =
+    context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+  NNTR_THROW_IF(weight.getDataType() != nntrainer::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[tie_word_embeddings] training forward only supports FP32 weight for "
+       "now";
+
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+
+  ml::train::TensorDim input_dim = input_.getDim();
+  ml::train::TensorDim hidden_dim = hidden_.getDim();
+
+  const unsigned int fallback_row = input_dim.height() - 1;
+
+  if (full_sequence_) {
+    // Rows 0..read_row of every sample, in one GEMM per sample. Pad rows are
+    // skipped: the loss layer never reads them and calcDerivative zeroes
+    // their gradient.
+    {
+      auto &disable_bias =
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+      NNTR_THROW_IF(disable_bias.empty() || !disable_bias.get(),
+                    std::invalid_argument)
+        << "[tie_word_embeddings] full_sequence requires disable_bias=true";
+    }
+    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
+      const unsigned int rows = readRowForBatch(b, fallback_row) + 1;
+      ml::train::TensorDim in_dim_b = input_dim;
+      in_dim_b.batch(1);
+      in_dim_b.height(rows);
+      ml::train::TensorDim out_dim_b = hidden_dim;
+      out_dim_b.batch(1);
+      out_dim_b.height(rows);
+      nntrainer::Tensor in_b = input_.getSharedDataTensor(
+        in_dim_b, b * input_dim.getFeatureLen(), true);
+      nntrainer::Tensor out_b = hidden_.getSharedDataTensor(
+        out_dim_b, b * hidden_dim.getFeatureLen(), true);
+      in_b.dot(weight, out_b, false, true);
+    }
+    return;
+  }
+
+  ml::train::TensorDim input_step_dim = input_dim;
+  ml::train::TensorDim hidden_step_dim = hidden_dim;
+
+  input_step_dim.batch(1);
+  input_step_dim.height(1);
+  hidden_step_dim.batch(1);
+
+  unsigned int b_size = input_dim.batch();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
+    nntrainer::Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim,
+      b * input_dim.getFeatureLen() + read_row * input_dim.width(), true);
+    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+    // tied weight is [vocab, hidden]; logits = x . W^T
+    input_step.dot(weight, hidden_step, false, true);
+
+    if (auto &disable_bias =
+          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      nntrainer::Tensor &bias =
+        context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
+      hidden_step.add_i(bias);
+    }
+  }
+}
 
 void TieWordEmbedding::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
@@ -869,12 +1023,185 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   }
 }
 
+/**
+ * @brief calcDerivative for TieWordEmbedding.
+ * @details Only lm_head mode is implemented: forwarding() only ever reads
+ *          one row (read_row) of the input per batch, so only that row
+ *          receives a non-zero gradient. Since forward computes
+ *          logits = x . W^T (tied weight W is [vocab, hidden]), the input
+ *          gradient is dx = dy . W (no transpose this time). embedding mode
+ *          has no meaningful gradient w.r.t. token indices and this
+ *          instance is always the first layer in the graph, so it keeps
+ *          throwing (matching the pre-existing behavior).
+ */
 void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for Embedding layer is not supported");
+  if (mode_ == mode::embedding) {
+    throw nntrainer::exception::not_supported(
+      "calcDerivative for embedding-mode TieWordEmbedding is not supported");
+  }
+
+  nntrainer::Tensor weight =
+    context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+  NNTR_THROW_IF(weight.getDataType() != nntrainer::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[tie_word_embeddings] calcDerivative only supports FP32 weight for "
+       "now";
+
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+
+  ml::train::TensorDim input_dim = dx.getDim();
+  ml::train::TensorDim dy_dim = dy.getDim();
+
+  const unsigned int fallback_row = input_dim.height() - 1;
+
+  dx.setZero();
+
+  if (full_sequence_) {
+    // dx[0..rows) = dy[0..rows) . W per sample; pad rows stay zero.
+    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
+      const unsigned int rows = readRowForBatch(b, fallback_row) + 1;
+      ml::train::TensorDim dx_dim_b = input_dim;
+      dx_dim_b.batch(1);
+      dx_dim_b.height(rows);
+      ml::train::TensorDim dy_dim_b = dy_dim;
+      dy_dim_b.batch(1);
+      dy_dim_b.height(rows);
+      nntrainer::Tensor dx_b =
+        dx.getSharedDataTensor(dx_dim_b, b * input_dim.getFeatureLen(), true);
+      nntrainer::Tensor dy_b =
+        dy.getSharedDataTensor(dy_dim_b, b * dy_dim.getFeatureLen(), true);
+      dy_b.dot(weight, dx_b, false, false);
+    }
+    return;
+  }
+
+  ml::train::TensorDim dx_step_dim = input_dim;
+  ml::train::TensorDim dy_step_dim = dy_dim;
+
+  dx_step_dim.batch(1);
+  dx_step_dim.height(1);
+  dy_step_dim.batch(1);
+
+  unsigned int b_size = input_dim.batch();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
+    nntrainer::Tensor dx_step = dx.getSharedDataTensor(
+      dx_step_dim, b * input_dim.getFeatureLen() + read_row * input_dim.width(),
+      true);
+    nntrainer::Tensor dy_step =
+      dy.getSharedDataTensor(dy_step_dim, b * dy_dim.getFeatureLen(), true);
+
+    // y = x . W^T  =>  dx = dy . W
+    dy_step.dot(weight, dx_step, false, false);
+  }
 }
 
-void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {}
+/**
+ * @brief calcGradient for TieWordEmbedding, for both modes.
+ * @details The embedding table and the LM head are the *same* weight when
+ *          embeddings are tied, so both instances accumulate into one
+ *          gradient. isGradientFirstAccess() decides which visit zeroes it;
+ *          every later visit adds, so the two contributions sum instead of
+ *          the second overwriting the first.
+ *
+ *          embedding mode: out[i] = W[id_i] * scale, so only the rows named
+ *            by the input token ids receive gradient:
+ *              dW[id_i] += dy[i] * scale
+ *          lm_head mode: y = x[read_row] . W^T (W is [vocab, hidden]), so
+ *              dW[v][h] += dy[v] * x[read_row][h]
+ *              dbias[v] += dy[v]
+ *
+ * @note Only invoked when the layer is trainable; frozen under LoRA-only
+ *       training. Safe to read the input because calcGradient runs before
+ *       calcDerivative (which is what overwrites the input with dx).
+ */
+void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
+  nntrainer::Tensor &dw =
+    context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  NNTR_THROW_IF(dw.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[tie_word_embeddings] calcGradient only supports FP32 for now";
+
+  if (context.isGradientFirstAccess(weight_idx[TieWordEmbeddingParams::weight]))
+    dw.setZero();
+
+  const ml::train::TensorDim dw_dim = dw.getDim();
+  const unsigned int hidden = dw_dim.width();
+  const unsigned int vocab = dw_dim.height();
+  float *dw_ = dw.getData<float>();
+  const float *dy_ = dy.getData<float>();
+
+  if (mode_ == mode::embedding) {
+    const float scale =
+      std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
+        ? 1.0f
+        : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
+
+    const ml::train::TensorDim in_dim = input_.getDim();
+    const ml::train::TensorDim dy_dim = dy.getDim();
+    const unsigned int seq_len = in_dim.width();
+    const float *ids = input_.getData<float>();
+
+    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+      const float *ids_b = ids + b * in_dim.getFeatureLen();
+      const float *dy_b = dy_ + b * dy_dim.getFeatureLen();
+      for (unsigned int i = 0; i < seq_len; ++i) {
+        const unsigned int id = static_cast<unsigned int>(ids_b[i]);
+        if (id >= vocab)
+          continue;
+        const float *dy_row = dy_b + i * hidden;
+        float *dw_row = dw_ + static_cast<size_t>(id) * hidden;
+        for (unsigned int h = 0; h < hidden; ++h)
+          dw_row[h] += dy_row[h] * scale;
+      }
+    }
+    return;
+  }
+
+  // lm_head mode
+  NNTR_THROW_IF(full_sequence_, std::invalid_argument)
+    << "[tie_word_embeddings] full_sequence lm_head weight gradient is not "
+       "implemented; keep the tied weight frozen (LoRA training does)";
+  const ml::train::TensorDim in_dim = input_.getDim();
+  const ml::train::TensorDim dy_dim = dy.getDim();
+  const unsigned int fallback_row = in_dim.height() - 1;
+
+  const float *x = input_.getData<float>();
+  for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
+    const float *x_row =
+      x + b * in_dim.getFeatureLen() + read_row * in_dim.width();
+    const float *dy_row = dy_ + b * dy_dim.getFeatureLen();
+    for (unsigned int v = 0; v < vocab; ++v) {
+      const float dyv = dy_row[v];
+      if (dyv == 0.0f)
+        continue;
+      float *dw_row = dw_ + static_cast<size_t>(v) * hidden;
+      for (unsigned int h = 0; h < hidden; ++h)
+        dw_row[h] += dyv * x_row[h];
+    }
+  }
+
+  if (auto &disable_bias =
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+      disable_bias.empty() || disable_bias.get() == false) {
+    nntrainer::Tensor &db =
+      context.getWeightGrad(weight_idx[TieWordEmbeddingParams::bias]);
+    if (context.isGradientFirstAccess(weight_idx[TieWordEmbeddingParams::bias]))
+      db.setZero();
+    float *db_ = db.getData<float>();
+    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+      const float *dy_row = dy_ + b * dy_dim.getFeatureLen();
+      for (unsigned int v = 0; v < vocab; ++v)
+        db_[v] += dy_row[v];
+    }
+  }
+}
 
 void TieWordEmbedding::exportTo(nntrainer::Exporter &exporter,
                                 const ml::train::ExportMethods &method) const {

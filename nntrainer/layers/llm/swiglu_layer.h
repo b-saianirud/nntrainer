@@ -22,6 +22,7 @@
 #define __SWIGLU_LAYER_H__
 #ifdef __cplusplus
 
+#include <array>
 #include <tuple>
 #include <vector>
 
@@ -71,6 +72,12 @@ public:
   void calcDerivative(RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   * @note resizes the private input caches on a batch-size change.
+   */
+  void setBatch(RunLayerContext &context, unsigned int batch) override;
+
+  /**
    * @copydoc Layer::updateTensorsByInputDimensions(RunLayerContext &context,
    * std::vector<TensorDim> input_dimensions)
    */
@@ -80,7 +87,7 @@ public:
   /**
    * @copydoc bool supportBackwarding() const
    */
-  bool supportBackwarding() const override { return false; };
+  bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -106,6 +113,14 @@ private:
        dead work there. The model sets the property; the layer just obeys it. */
   std::tuple<props::Print, props::SkipPrefill> swiglu_props;
   bool skip_prefill = false; /**< cached SkipPrefill, resolved in finalize() */
+
+  /**< true when finalize() ran under ExecutionMode::TRAIN: private copies of
+       gate/up are requested for calcDerivative(). SwiGLU has no weights, so
+       nntrainer only keeps its input buffers alive through forwarding() and the
+       memory planner may reuse them before backward runs. (Candidate to replace
+       with Layer::getInputLifespan() once that is validated for training.) */
+  bool cache_inputs = false;
+  std::array<unsigned int, 2> cache_idx = {0, 0};
 };
 
 } // namespace nntrainer

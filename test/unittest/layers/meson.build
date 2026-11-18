@@ -74,6 +74,7 @@ test_target = [
   'unittest_layers_kld_loss.cpp',
   'unittest_layers_fully_connected.cpp',
   'unittest_layers_fully_connected_lora.cpp',
+  'unittest_layers_llm_backward.cpp',
   'unittest_layers_batch_normalization.cpp',
   'unittest_layers_layer_normalization.cpp',
   'unittest_layers_convolution2d.cpp',
