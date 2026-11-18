@@ -123,12 +123,21 @@ void MemoryPool::allocate() {
   ml_logi("MemoryPool::allocate size: %zu allocator: %s", pool_size,
           allocator_->getName().c_str());
 
-  if (allocator_->getName() == "qnn") {
+  // QNN and the Hexagon FastRPC bridge (an allocator whose memory needs
+  // registering with the DSP) both allocate through an underlying RPC API whose
+  // size parameter is a 32-bit int (~2 GiB ceiling per call - see
+  // HexagonRpcAllocator/rpcmem_alloc). A single training-sized activation
+  // pool (every layer's backward-liveness tensors, easily 2+ GiB at real
+  // batch/seq_len) can't fit in one contiguous alloc() call, so both share
+  // this per-offset scheme instead: one physical buffer per distinct
+  // planned offset (the memory planner's peak live-tensor "slot" count, not
+  // per-tensor), each far below the single-allocation ceiling.
+  if (allocator_->getName() == "qnn" || allocator_->needsRegister()) {
     const auto &allocation_sizes =
       memory_size.empty() ? planned_memory_size_ : memory_size;
     NNTR_THROW_IF(allocation_sizes.size() != memory_offset.size(),
                   std::runtime_error)
-      << "QNN memory layout metadata is stale; call planLayout() before "
+      << "Memory layout metadata is stale; call planLayout() before "
          "allocate()";
 
     std::map<size_t, size_t> offset_size;

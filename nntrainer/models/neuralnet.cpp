@@ -433,6 +433,46 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
     std::vector<Connection>(label_layers.begin(), label_layers.end()));
   NN_RETURN_STATUS();
 
+  // Only checkable now: the initialize() call just above is what runs
+  // LayerNode::finalize() on every node (via finalizeContext,
+  // network_graph.cpp:~1212), which is what copies the "engine=htp"
+  // property into the compute_engine member getComputeEngineType() reads
+  // (layer_node.cpp:637-639) - checking any earlier (e.g. in compile(),
+  // before finalize() has run at all) always sees the pre-finalize default.
+  // Still well before model_graph.allocateWeights() below actually allocates
+  // memory, so setComputeBackend()'s "before allocateTensors()/
+  // allocateWeights()" contract holds.
+  bool has_rpc_engine = false;
+  for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+    if ((*iter)->getComputeEngineType() != "htp")
+      continue;
+    // The htp context only hands out an rpcmem allocator when it runs the
+    // FastRPC bridge; with HexKL it keeps the CPU allocator and nothing here
+    // applies.
+    auto mem = Engine::Global().getRegisteredContext("htp")->getMemAllocator();
+    has_rpc_engine = mem != nullptr && mem->needsRegister();
+    break;
+  }
+
+  // Same rationale as the QNN setComputeBackend block in compile() above, for
+  // the FastRPC bridge: the allocator backs the activation tensors with rpcmem
+  // so the bridge can hand the DSP a pointer it maps directly, instead of
+  // memcpy-ing into a separate staging buffer on every accelerated GEMM call.
+  // Weights are uploaded to the DSP's own pinned arena by HexagonComputeOps
+  // separately (see hexagon_compute_ops.cpp's ensure_uploaded), so only the
+  // activation pool needs to move here - the same "tensor-only" split as QNN.
+  if (has_rpc_engine)
+    model_graph.setComputeBackend("", "htp");
+
+  // QNN and bridge activation tensors are rpcmem-backed and registered with
+  // the DSP, so their addresses must stay stable across decode tokens. Let
+  // inference() reuse the pool (allocate once) instead of reallocating per
+  // call. CPU/GPU keep the realloc-per-call behavior they need for correct
+  // tensor state. reuse_inference_tensor_pool_ was provisionally set from
+  // has_qnn_engine alone in compile() (has_rpc_engine wasn't knowable
+  // there) - OR in the bridge half now that it is.
+  reuse_inference_tensor_pool_ = reuse_inference_tensor_pool_ || has_rpc_engine;
+
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
 
@@ -2709,7 +2749,17 @@ int NeuralNetwork::train(const std::vector<std::string> &values,
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
 
-  status = allocate(ExecutionMode::TRAIN);
+  // Model::compile(x, y, mode) already allocates the activation pool at this
+  // same TRAIN mode/batch size (see tensor_api_graph.cpp step 5). For a
+  // QNN/bridge graph that pool is rpcmem-backed and pinned with the DSP (see
+  // reuse_inference_tensor_pool_), so freeing and reallocating it here would
+  // hand the DSP a stale mapping ("buffer mapping failed"). allocateTensors()
+  // alone is a safe no-op if already allocated (see
+  // Manager::allocateTensors), so reuse compile()'s pool instead.
+  if (reuse_inference_tensor_pool_)
+    model_graph.allocateTensors(ExecutionMode::TRAIN);
+  else
+    status = allocate(ExecutionMode::TRAIN);
   NN_RETURN_STATUS();
 
   status =

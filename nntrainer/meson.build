@@ -84,6 +84,10 @@ if get_option('enable-npu')
   # The qnn subdir is processed after nntrainer_dep is available (see below).
 endif
 
+if get_option('enable-hexagon-cdsp')
+  nntrainer_elements += 'hexagon'
+endif
+
 foreach elem : nntrainer_elements
   if elem != 'qnn'
     subdir(elem)
@@ -122,7 +126,7 @@ if get_option('enable-cuda')
   nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
 
-if get_option('enable-htp')
+if get_option('enable-htp') or get_option('enable-hexagon-cdsp')
   nntrainer_headers += meson.current_source_dir() / 'htp_context.h'
   nntrainer_common_sources += 'htp_context.cpp'
 endif

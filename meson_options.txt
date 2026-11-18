@@ -20,6 +20,8 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
+# Hexagon cDSP direct path (FastRPC + the ggml-hexagon bridge), used for NPU LoRA training.
+option('enable-hexagon-cdsp', type: 'boolean', value: false)
 option('qnn-sdk-root', type: 'string', value: '')
 # HTP (Hexagon Tensor Processor / HMX) backend via the Qualcomm HexKL
 # CPU Macro API (sdkl.h / libsdkl.so). Proprietary SDK is NOT vendored;

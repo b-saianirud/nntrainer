@@ -27,7 +27,8 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 #include <env_compat.h>
-#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+#if (defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1) ||                            \
+  (defined(ENABLE_HEXAGON_CDSP) && ENABLE_HEXAGON_CDSP == 1)
 #include <htp_context.h>
 #endif
 
@@ -183,7 +184,8 @@ void Engine::add_default_object() {
   }
 #endif
 
-#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
+#if (defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1) ||                            \
+  (defined(ENABLE_HEXAGON_CDSP) && ENABLE_HEXAGON_CDSP == 1)
   auto &htp_context = nntrainer::HtpContext::Global();
   registerContext("htp", &htp_context);
 #endif

@@ -16,13 +16,15 @@
  * ComputeOps installed into this context's ContextData — HtpComputeOps
  * when the NPU initialized, else the CPU ops as a transparent fallback.
  *
- * Compiled only when ENABLE_HEXKL is defined (meson: -Denable-htp=true).
+ * Compiled when ENABLE_HEXKL is defined (meson: -Denable-htp=true) and/or
+ * ENABLE_HEXAGON_CDSP (meson: -Denable-hexagon-cdsp=true). The latter selects
+ * the FastRPC bridge backend (see initialize()).
  */
 
 #ifndef __HTP_CONTEXT_H__
 #define __HTP_CONTEXT_H__
 #ifdef __cplusplus
-#ifdef ENABLE_HEXKL
+#if defined(ENABLE_HEXKL) || defined(ENABLE_HEXAGON_CDSP)
 
 #include <memory>
 #include <string>
@@ -58,6 +60,6 @@ protected:
 
 } // namespace nntrainer
 
-#endif // ENABLE_HEXKL
+#endif // ENABLE_HEXKL || ENABLE_HEXAGON_CDSP
 #endif /* __cplusplus */
 #endif /* __HTP_CONTEXT_H__ */
