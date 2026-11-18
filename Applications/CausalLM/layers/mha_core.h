@@ -719,8 +719,15 @@ private:
      * 3.7 int8 KV path; only requested when kv_int8 mode is active). */
     cache_key_scale,
     cache_value_scale,
+    /** training-only caches (see trainForwarding()/calcDerivative()) */
+    train_q_roped,
+    train_k_roped,
+    train_attn_wt,
+    /** private copy of V: the VALUE input of this layer is not kept alive
+     *  until calcDerivative() (the layer is weightless/frozen) */
+    train_v,
   };
-  std::array<unsigned int, 9> tensor_idx;
+  std::array<unsigned int, 13> tensor_idx;
 
   /** True when KV cache is stored as int8 (raw bytes treated as
    * int8) + per-(token, head) FP16 scales. Enabled by setting the
@@ -740,6 +747,23 @@ private:
   const uint16_t *cur_kv_int8_key_scale_batch = nullptr;
   const uint16_t *cur_kv_int8_value_scale_batch = nullptr;
   unsigned int sink_idx;
+
+  /** whether the training-only tensors above were requested (only true when
+   *  !use_external_cache and the graph was compiled for TRAIN) */
+  bool train_tensors_requested = false;
+
+  /** whether the most recent trainForwarding() call dispatched attention
+   *  through the DSP flash-attention bridge instead of the CPU path. Flash
+   *  attention never materializes the [S,S] softmax matrix, so train_attn_wt
+   *  is left unpopulated whenever this is true - calcDerivative() reads this
+   *  flag to decide whether it must recompute the attention weights from
+   *  train_q_roped/train_k_roped instead of reading them out of the cache. */
+  bool last_forward_used_flash = false;
+
+  /** whether the internal KV cache tensors were requested (only true when
+   *  !use_external_cache and the graph was NOT compiled for TRAIN; training
+   *  never uses the cache, so it is not allocated there) */
+  bool internal_cache_requested = false;
 
   /** attention parameters */
   unsigned int max_position_embeddings;
@@ -892,6 +916,48 @@ private:
    * @param context Context of the layer
    */
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
+
+  /**
+   * @brief Full-sequence (training) forward for the internal-cache
+   *        (!use_external_cache) path. Implements a plain, dense causal
+   *        multi-head attention with GQA — deliberately not reusing the
+   *        packed/windowed/threaded inference kernels above, so the math
+   *        stays simple enough to verify with a finite-difference gradient
+   *        check. Scope: FP32 only, is_causal, no sliding window, no
+   *        attention sink, no logit softcapping (Qwen3-dense default
+   *        config) — training with any of those features enabled throws.
+   */
+  void trainForwarding(nntrainer::RunLayerContext &context);
+
+  /** Request the private training caches (train_q_roped, ...) at finalize(). */
+  void requestTrainingTensors(nntrainer::InitLayerContext &context,
+                              unsigned int batch_size,
+                              unsigned int train_seq_len);
+
+  /** Resize the training caches on a batch-size change. */
+  void resizeTrainingTensors(nntrainer::RunLayerContext &context,
+                             unsigned int batch);
+
+  /** Resize the training caches on a sequence-length change. */
+  void updateTrainingTensors(
+    nntrainer::RunLayerContext &context,
+    const std::vector<nntrainer::TensorDim> &input_dimensions);
+
+  /**
+   * @brief Undo the rotate-half RoPE rotation on a gradient tensor.
+   * @details Forward applies, per (position, head) pair and per rotated
+   *          coordinate pair (i0, i1 = i0 + half_): out_i0 = a*cos - b*sin,
+   *          out_i1 = a*sin + b*cos. This is an orthogonal 2D rotation, so
+   *          the backward pass applies its transpose (equivalently, the
+   *          rotation by -theta): d_a = cos*d_i0 + sin*d_i1,
+   *          d_b = -sin*d_i0 + cos*d_i1.
+   * @param grad gradient buffer to rotate in place, laid out identically to
+   *        the forward RoPE input (contiguous rows of `width` elements,
+   *        `dim`-sized head chunks within each row).
+   */
+  void apply_inverse_rotary_emb(float *grad, unsigned int width,
+                                unsigned int dim, unsigned int height,
+                                unsigned int from);
 
   size_t calc_attn_index(size_t i);
 

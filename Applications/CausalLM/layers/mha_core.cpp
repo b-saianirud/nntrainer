@@ -1021,9 +1021,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   // baseline stays default.
   kv_int8 = std::getenv("NNTR_KV_INT8") != nullptr;
 
+  const bool for_training =
+    (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN);
+
   /** Tensor for KV-Cache (only allocate internally when not using external
-   * cache) */
-  if (!use_external_cache) {
+   * cache). Training consumes the whole fixed-length sequence in one forward
+   * pass (trainForwarding()), so the cache is dead weight there. */
+  if (!use_external_cache && !for_training) {
+    internal_cache_requested = true;
     if (kv_int8) {
       ml::train::TensorDim cache_key_dim(
         {batch_size, 1, max_timestep, num_heads_KV * head_dim},
@@ -1075,6 +1080,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
         nntrainer::TensorLifespan::MAX_LIFESPAN);
     }
   }
+
+  if (!use_external_cache && for_training)
+    requestTrainingTensors(context, batch_size, query_dim.height());
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
@@ -1266,6 +1274,13 @@ void MHACoreLayer::ensure_rope_flat_lut() {
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   if (!use_external_cache) {
+    // Gated on the training caches existing, NOT on `training`: validation
+    // also comes through forwarding() (training=false) and must still compute
+    // attention. The caches are only requested when finalized for TRAIN.
+    if (train_tensors_requested) {
+      trainForwarding(context);
+      return;
+    }
     // 3/4-input (internal KV cache) mode: full-sequence self-attention.
     //
     // incremental_forwarding() is being phased out as the inference entry
@@ -6003,8 +6018,11 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  if (internal_cache_requested) {
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  }
+  resizeTrainingTensors(context, batch);
   // context.updateTensor(tensor_idx[AttentionParams::attention_weight], batch);
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
@@ -6039,13 +6057,14 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateInput(INOUT_INDEX::VALUE, kv_dim);
   context.updateOutput(0, input_dimensions[0]);
 
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
+  if (internal_cache_requested) {
+
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value],
+                         kv_cache_dim);
+  }
+  updateTrainingTensors(context, input_dimensions);
 }
-
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
-
-void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
                             const ml::train::ExportMethods &method) const {

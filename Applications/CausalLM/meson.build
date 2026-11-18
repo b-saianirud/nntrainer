@@ -488,6 +488,23 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # mha_core's training path: backward vs finite differences, forward vs the
+  # inference prefill. Host only: the DSP flash-attention bridge is optional.
+  unittest_mha_core_train = executable(
+    'unittest_mha_core_train',
+    meson.current_source_dir() / 'layers' / 'unittest_mha_core_train.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_mha_core_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_mha_core_train', unittest_mha_core_train,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_mha_core_train'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # KV window-ring rule (kv_ring.h): host-only, no GPU needed. Pins the
   # capacity formula and the row wrap that the model-side allocation and the
   # layer-side modulo map must both obey.
