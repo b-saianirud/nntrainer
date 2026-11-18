@@ -250,6 +250,8 @@ causallm_src = [
   causallm_root / 'layers' / 'per_layer_slice_gpu.cpp',
   causallm_root / 'layers' / 'rms_norm_gpu.cpp',
   causallm_root / 'layers' / 'mha_core.cpp',
+  causallm_root / 'layers' / 'mha_core_train.cpp',
+  causallm_root / 'layers' / 'causal_lm_loss.cpp',
   causallm_root / 'layers' / 'reshaped_rms_norm.cpp',
   causallm_root / 'layers' / 'custom_multiply.cpp',
   causallm_root / 'layers' / 'causal_conv1d_layer.cpp',
@@ -456,6 +458,15 @@ executable('nntr_causallm',
 )
 
 # ── Native tools ─────────────────────────────────────────────────────────
+# nntr_lora_train: on-device LoRA fine-tuning (NPU-accelerated when built with
+# -Denable-hexagon-cdsp=true).
+executable('nntr_lora_train',
+    [causallm_root / 'lora_train.cpp', causallm_root / 'train_qwen3_lora.cpp'],
+    dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
+    cpp_args: causallm_inc_args,
+    install: false,
+)
+
 executable('nntr_quantize',
     causallm_root / 'quantize.cpp',
     dependencies: [nntrainer_dep, causallm_dep, openmp_dep, thread_dep, log_dep],
