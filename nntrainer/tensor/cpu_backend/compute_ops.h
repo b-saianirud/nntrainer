@@ -552,6 +552,30 @@ public:
   virtual void fc(Tensor &input, Tensor &weight, Tensor &output);
 
   /**
+   * @brief Forward matmul against a FROZEN, possibly quantized base weight:
+   *        output = input * weight, at the activation's full precision.
+   *
+   * @details LoRA fine-tuning keeps the base weight frozen in Q4_0/Q6_K and
+   * trains FP32 adapters on top. The fused W4A8 kernels behind dot() also
+   * quantize the activation to Q8_0, which adds noise training does not
+   * tolerate, so this op multiplies at the activation dtype instead (the
+   * weight is dequantized exactly). An accelerator overrides it to keep the
+   * weight resident on the device and must produce the same result, falling
+   * back to the base implementation for shapes or values it cannot take.
+   */
+  virtual void fc_frozen(Tensor &input, Tensor &weight, Tensor &output);
+
+  /**
+   * @brief Input gradient through a frozen base weight:
+   *        dx = dy * weight^T, at the activation's full precision.
+   *
+   * @details Backward counterpart of fc_frozen(). The weight gets no
+   * gradient, so no dW is produced. The LoRA term of dx is added by the
+   * caller.
+   */
+  virtual void fc_frozen_dgrad(const Tensor &dy, Tensor &weight, Tensor &dx);
+
+  /**
    * @brief Optional one-time weight transform at load time, e.g. an
    *        accelerator repack. Default no-op; called from the layer's read()
    *        once the weights are in memory.

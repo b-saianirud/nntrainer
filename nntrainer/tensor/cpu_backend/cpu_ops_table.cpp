@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 #include <acti_func.h>
+#include <quantizer.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -346,6 +347,34 @@ void CpuComputeOps::residual_op(Tensor &hidden, const Tensor &input,
 
 void CpuComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   input.dot(weight, output, false, false);
+}
+
+namespace {
+/** Q4_0/Q6_K weights are dequantized to the activation dtype; plain float
+ * weights are used as they are. */
+Tensor frozen_weight_view(Tensor &weight, Tdatatype act_dtype) {
+  switch (weight.getDataType()) {
+  case Tdatatype::Q4_0:
+    return Quantization::createQuantizer(QScheme::Q4_0)
+      ->dequantize(weight, act_dtype);
+  case Tdatatype::Q6_K:
+    return Quantization::createQuantizer(QScheme::Q6_K)
+      ->dequantize(weight, act_dtype);
+  default:
+    return weight;
+  }
+}
+} // namespace
+
+void CpuComputeOps::fc_frozen(Tensor &input, Tensor &weight, Tensor &output) {
+  Tensor w = frozen_weight_view(weight, input.getDataType());
+  input.dot(w, output, false, false);
+}
+
+void CpuComputeOps::fc_frozen_dgrad(const Tensor &dy, Tensor &weight,
+                                    Tensor &dx) {
+  Tensor w = frozen_weight_view(weight, dx.getDataType());
+  dx.dot_deriv_wrt_1(w, dy, false, false);
 }
 
 void CpuComputeOps::apply_activation(Tensor &out, int act_type) {

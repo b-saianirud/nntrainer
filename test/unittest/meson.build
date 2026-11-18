@@ -58,6 +58,8 @@ test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
   ['unittest_compute_ops_dispatch', []],
+  # fc_frozen / fc_frozen_dgrad: the frozen-Q4_0 LoRA matmul contract.
+  ['unittest_compute_ops_frozen_fc', []],
   # Closed-form contract for the fused sigmoid-gated whole-ops.
   ['unittest_sigmoid_gate_ops', []],
   ['unittest_nntrainer_fallback', []],

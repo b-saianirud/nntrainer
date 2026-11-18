@@ -439,6 +439,10 @@ void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
   NI(residual_op);
 }
 void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
+void ComputeOps::fc_frozen(Tensor &, Tensor &, Tensor &) { NI(fc_frozen); }
+void ComputeOps::fc_frozen_dgrad(const Tensor &, Tensor &, Tensor &) {
+  NI(fc_frozen_dgrad);
+}
 void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
 void ComputeOps::mean_rows(const Tensor &, Tensor &, unsigned int,
                            unsigned int) {
