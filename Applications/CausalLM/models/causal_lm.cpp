@@ -352,14 +352,23 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
           .get<unsigned int>();
   }
 
-  if (generation_cfg["eos_token_id"].is_array()) {
+  // generation_config.json is optional (e.g. absent on some on-device
+  // deployments); fall back to config.json's eos/bos ids rather than
+  // indexing a missing key, which would default-construct a JSON null and
+  // blow up on .get<unsigned int>().
+  const bool has_eos = generation_cfg.contains("eos_token_id") &&
+                       !generation_cfg["eos_token_id"].is_null();
+  if (has_eos && generation_cfg["eos_token_id"].is_array()) {
     EOS_TOKEN_ID =
       generation_cfg["eos_token_id"].empty()
         ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
         : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
-  } else {
+  } else if (has_eos) {
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
+  } else {
+    EOS_TOKEN_ID.clear();
+    EOS_TOKEN_ID.push_back(cfg["eos_token_id"].get<unsigned int>());
   }
   if (EOS_TOKEN_ID.empty()) {
     // Without an EOS id nothing can break the decode loop early, so a config
@@ -872,6 +881,19 @@ Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
   }
   if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+
+  // Next-token training at every position: project all real rows. Only the
+  // tied lm_head implements this (Qwen3 ties embeddings).
+  if (FOR_TRAINING && FULL_SEQ_LOSS) {
+    NNTR_THROW_IF(!TIE_WORD_EMBEDDINGS, std::invalid_argument)
+      << "full-sequence loss needs tie_word_embeddings";
+    lmhead_prop.emplace_back(withKey("full_sequence", "true"));
+  }
+
+  // lm_head is never a LoRA target: freeze it whenever LoRA is active.
+  if (LORA_RANK > 0)
+    lmhead_prop.emplace_back(withKey("trainable", "false"));
+
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
   return lmhead(h);
 }

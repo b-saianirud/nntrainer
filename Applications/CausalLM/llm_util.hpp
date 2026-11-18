@@ -72,6 +72,65 @@ static std::string withKey(const std::string &key,
 }
 
 /**
+ * @brief Mutable override for useHexagonCdsp(), checked in addition to the
+ * NNTR_USE_HEXAGON_CDSP env var. Lets a caller build a graph that never runs
+ * forwarding (e.g. a throwaway graph used only to load/copy weight tensors)
+ * without engine=htp, so it never allocates its own Hexagon-backed
+ * activation pool. That pool would be pure waste (no GEMM ever runs on such a
+ * graph) and, worse, freeing it while the real graph's pinned/eager-mapped
+ * pool is still live can hand the freed pool's fd back to a later,
+ * differently-sized allocation - see HexagonRpcAllocator/nntr-htp-bridge's
+ * pinned-pool contract.
+ */
+inline bool &hexagonCdspTaggingSuppressed() {
+  static bool suppressed = false;
+  return suppressed;
+}
+
+/**
+ * @brief Whether Q4_0 FC layers should be tagged engine=htp, so they
+ * dispatch their GEMM through HexagonComputeOps (see
+ * nntrainer/hexagon/hexagon_context.cpp) instead of the CPU NEON/AVX path.
+ * Checked once per process via NNTR_USE_HEXAGON_CDSP; only meaningful on a
+ * build with -Denable-hexagon-cdsp=true and libggml-hexagon.so reachable at
+ * runtime (see nntr-htp-bridge.cpp in the ggml-hexagon repo) - otherwise
+ * layer creation under the "htp" context, or the first accelerated GEMM
+ * call, will fail.
+ */
+inline bool useHexagonCdsp() {
+  static const bool use_cdsp = std::getenv("NNTR_USE_HEXAGON_CDSP") != nullptr;
+  return use_cdsp && !hexagonCdspTaggingSuppressed();
+}
+
+/**
+ * @brief Append engine=htp to a fully_connected layer's properties when
+ * useHexagonCdsp() is set. Only meant for FC layers that hold Q4_0 weights
+ * (the accel GEMM is Q4_0-specific - see
+ * ComputeOps::supports_gemm_q4_0_accel_fp32) - tagging an FP32/Q6_K-weight
+ * layer (e.g. embedding, lm_head) this way is harmless but pointless, since
+ * the dtype check in float_tensor.cpp's dotQnK will just fall through to the
+ * normal CPU path for it anyway.
+ */
+inline std::string causallm_engine(); // defined below
+
+inline std::vector<std::string>
+withHexagonEngine(std::vector<std::string> props) {
+  const auto is_engine = [](const std::string &p) {
+    return p.rfind("engine=", 0) == 0;
+  };
+  if (useHexagonCdsp()) {
+    // Builders already carry engine=causallm_engine() (upstream); the NPU tag
+    // replaces it rather than adding a second "engine" property.
+    props.erase(std::remove_if(props.begin(), props.end(), is_engine),
+                props.end());
+    props.push_back(withKey("engine", "htp"));
+  } else if (std::none_of(props.begin(), props.end(), is_engine)) {
+    props.push_back(withKey("engine", causallm_engine()));
+  }
+  return props;
+}
+
+/**
  * @brief
  */
 template <typename T>

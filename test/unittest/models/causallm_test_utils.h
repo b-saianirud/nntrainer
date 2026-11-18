@@ -423,6 +423,9 @@ public:
     this->model->forEachLayer(fn, nullptr);
   }
 
+  // Unhide the 2-argument overload from the base class
+  using ModelBase::forEachLayer;
+
 private:
   /**
    * @brief Build the (input, cache_inputs) pair for incremental_inference
