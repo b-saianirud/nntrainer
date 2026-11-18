@@ -58,6 +58,7 @@ causallm_layer_dependencies += [
     causallm_rms_norm_dep,
     causallm_rms_norm_gpu_dep,
     # tie_word_embedding, lm_head and swiglu are core nntrainer layers
+    causallm_causal_lm_loss_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
@@ -501,6 +502,22 @@ if get_option('enable-test')
 
   test('unittest_mha_core_train', unittest_mha_core_train,
     args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_mha_core_train'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  # causal_lm_loss: the full-sequence next-token loss LoRA training uses.
+  unittest_causal_lm_loss = executable(
+    'unittest_causal_lm_loss',
+    meson.current_source_dir() / 'layers' / 'unittest_causal_lm_loss.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_causal_lm_loss_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_causal_lm_loss', unittest_causal_lm_loss,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_causal_lm_loss'),
     timeout: 60,
     suite: 'unittests'
   )

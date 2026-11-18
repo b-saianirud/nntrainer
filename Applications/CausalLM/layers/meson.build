@@ -9,6 +9,7 @@ causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp'
 causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d_layer.cpp']
 causallm_mha_core_abs = [meson.current_source_dir() / 'mha_core.cpp',
     meson.current_source_dir() / 'mha_core_train.cpp']
+causallm_causal_lm_loss_src_abs = [meson.current_source_dir() / 'causal_lm_loss.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
 causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms_norm.cpp']
 causallm_rms_reverse_norm_src_abs = [meson.current_source_dir() / 'rms_reverse_norm.cpp']
@@ -62,6 +63,19 @@ causallm_causal_conv1d_dep = declare_dependency(
 )
 
 
+
+causallm_causal_lm_loss = shared_library(
+    'causal_lm_loss_layer',
+    causallm_causal_lm_loss_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_causal_lm_loss_dep = declare_dependency(
+    link_with: causallm_causal_lm_loss,
+    include_directories: causallm_layer_inc
+)
 
 causallm_mha_core = shared_library(
     'mha_core_layer',
