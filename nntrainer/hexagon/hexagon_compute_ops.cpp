@@ -37,9 +37,11 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -226,6 +228,142 @@ public:
   }
 
   /**
+   * logits = input * W^T for a frozen FP32 weight stored [out x in] (tied
+   * embedding / lm_head: 151936 x 1024). The weight is far larger than one
+   * bridge arena, so it is uploaded as FP16 row chunks and the product is
+   * computed chunk by chunk; each chunk's [M x chunk] result is scattered
+   * into its columns of the output. NNTR_HEXAGON_NT=0 disables, and any
+   * bridge failure falls back to the exact CPU product.
+   */
+  void fc_frozen_nt(Tensor &input, Tensor &weight, Tensor &output) override {
+    const BridgeApi &api = get_bridge_api();
+    const unsigned int M = rowsOf(input);
+    const unsigned int K = input.width();
+    const unsigned int N = output.width();
+    if (api.gemm_f16w && ntOnDsp(weight, input, output, M, K, N)) {
+      std::lock_guard<std::mutex> lk(nt_mtx_);
+      const float *w = weight.getData<float>();
+      const unsigned int chunk = ntChunk();
+      const char *base = reinterpret_cast<const char *>(weight.getData());
+      bool ok = true;
+      unsigned int idx = 0;
+      for (unsigned int c0 = 0; c0 < N && ok; c0 += chunk, ++idx) {
+        const unsigned int nc = std::min(chunk, N - c0);
+        const void *key = base + 1 + idx;
+        std::vector<uint16_t> w16;
+        if (!has_f16_copy(key)) {
+          w16.resize(static_cast<size_t>(nc) * K);
+          const float *src = w + static_cast<size_t>(c0) * K;
+          for (size_t i = 0; i < w16.size(); ++i)
+            w16[i] = compute_fp32_to_fp16(src[i]);
+        }
+        nt_tmp_.resize(static_cast<size_t>(M) * nc);
+        ok =
+          api.gemm_f16w(key, w16.empty() ? nullptr : w16.data(),
+                        input.getData<float>(), nt_tmp_.data(), M, nc, K) == 0;
+        if (!ok)
+          break;
+        mark_f16_copy(key);
+        float *out = output.getData<float>();
+        for (unsigned int m = 0; m < M; ++m)
+          std::memcpy(out + static_cast<size_t>(m) * N + c0,
+                      nt_tmp_.data() + static_cast<size_t>(m) * nc,
+                      sizeof(float) * nc);
+      }
+      if (ok) {
+        if (ntCheck())
+          ntCheckForward(input, weight, output, M, K, N);
+        return;
+      }
+      ml_logw("HexagonComputeOps::fc_frozen_nt: bridge failed (M=%u N=%u K=%u)"
+              " - using the CPU path",
+              M, N, K);
+    }
+    CpuComputeOps::fc_frozen_nt(input, weight, output);
+  }
+
+  /**
+   * dx = dy * W for the same weight: a sum over the vocabulary, done as one
+   * product per chunk against a resident FP16 copy of that chunk transposed
+   * to [in x chunk]. dy is scaled by a power of two before the FP16 conversion
+   * (softmax gradients are tiny and would flush to zero) and the result is
+   * scaled back exactly.
+   */
+  void fc_frozen_nt_dgrad(const Tensor &dy, Tensor &weight,
+                          Tensor &dx) override {
+    const BridgeApi &api = get_bridge_api();
+    const unsigned int M = rowsOf(dy);
+    const unsigned int N = dy.width();
+    const unsigned int K = dx.width(); /* hidden size */
+    if (api.gemm_f16w && ntOnDsp(weight, dx, dy, M, K, N)) {
+      std::lock_guard<std::mutex> lk(nt_mtx_);
+      const float *w = weight.getData<float>();
+      const float *g = dy.getData<float>();
+      const unsigned int chunk = ntBackChunk();
+      const char *base = reinterpret_cast<const char *>(weight.getData());
+
+      float maxabs = 0.0f;
+      const size_t total = static_cast<size_t>(M) * N;
+      for (size_t i = 0; i < total; ++i)
+        maxabs = std::max(maxabs, std::fabs(g[i]));
+      float *out = dx.getData<float>();
+      if (std::isfinite(maxabs) && maxabs == 0.0f) {
+        std::memset(out, 0, sizeof(float) * static_cast<size_t>(M) * K);
+        return;
+      }
+      if (std::isfinite(maxabs)) {
+        const int e = static_cast<int>(std::floor(std::log2(8.0f / maxabs)));
+        const float scale = std::ldexp(1.0f, e);
+        const float inv = std::ldexp(1.0f, -e);
+
+        bool ok = true;
+        unsigned int idx = 0;
+        std::vector<float> acc(static_cast<size_t>(M) * K, 0.0f);
+        for (unsigned int c0 = 0; c0 < N && ok; c0 += chunk, ++idx) {
+          const unsigned int nc = std::min(chunk, N - c0);
+          const void *key = base + 1000 + idx;
+          std::vector<uint16_t> w16;
+          if (!has_f16_copy(key)) {
+            w16.resize(static_cast<size_t>(K) * nc);
+            for (unsigned int j = 0; j < nc; ++j) {
+              const float *row = w + static_cast<size_t>(c0 + j) * K;
+              for (unsigned int h = 0; h < K; ++h)
+                w16[static_cast<size_t>(h) * nc + j] =
+                  compute_fp32_to_fp16(row[h]);
+            }
+          }
+          nt_tmp_.resize(static_cast<size_t>(M) * nc);
+          for (unsigned int m = 0; m < M; ++m) {
+            const float *src = g + static_cast<size_t>(m) * N + c0;
+            float *dst = nt_tmp_.data() + static_cast<size_t>(m) * nc;
+            for (unsigned int j = 0; j < nc; ++j)
+              dst[j] = src[j] * scale;
+          }
+          nt_out_.resize(static_cast<size_t>(M) * K);
+          ok = api.gemm_f16w(key, w16.empty() ? nullptr : w16.data(),
+                             nt_tmp_.data(), nt_out_.data(), M, K, nc) == 0;
+          if (!ok)
+            break;
+          mark_f16_copy(key);
+          for (size_t i = 0; i < acc.size(); ++i)
+            acc[i] += nt_out_[i];
+        }
+        if (ok) {
+          for (size_t i = 0; i < acc.size(); ++i)
+            out[i] = acc[i] * inv;
+          if (ntCheck())
+            ntCheckBackward(dy, weight, dx, M, K, N);
+          return;
+        }
+        ml_logw("HexagonComputeOps::fc_frozen_nt_dgrad: bridge failed (M=%u "
+                "N=%u K=%u) - using the CPU path",
+                M, N, K);
+      }
+    }
+    CpuComputeOps::fc_frozen_nt_dgrad(dy, weight, dx);
+  }
+
+  /**
    * FP32 GEMM, used by the large training matmuls that have no quantized
    * weight (alpha = 1, beta = 0, tight leading dimensions). Skinny GEMMs
    * (LoRA rank-sized N or K) are dispatch-bound and the DSP MUL_MAT path
@@ -265,6 +403,84 @@ private:
     return weight.getDataType() == Tdatatype::Q4_0 &&
            a.getDataType() == Tdatatype::FP32 &&
            b.getDataType() == Tdatatype::FP32;
+  }
+
+  /** FP32 weight [N x K] against FP32 activations, shapes the DSP can take */
+  static bool ntOnDsp(const Tensor &weight, const Tensor &a, const Tensor &b,
+                      unsigned int M, unsigned int K, unsigned int N) {
+    static const bool off = [] {
+      const char *v = std::getenv("NNTR_HEXAGON_NT");
+      return v != nullptr && v[0] == '0';
+    }();
+    return !off && weight.getDataType() == Tdatatype::FP32 &&
+           a.getDataType() == Tdatatype::FP32 &&
+           b.getDataType() == Tdatatype::FP32 && M >= 1 && M <= 1024 &&
+           K % 32 == 0 && N % 32 == 0 &&
+           weight.size() == static_cast<size_t>(N) * K;
+  }
+  /** rows of the vocabulary uploaded per FP16 chunk (multiple of 32) */
+  static unsigned int ntChunk() {
+    static const unsigned int c = [] {
+      const char *v = std::getenv("NNTR_HEXAGON_NT_CHUNK");
+      const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 32768ul;
+      return static_cast<unsigned int>(n >= 32 ? (n / 32) * 32 : 32768ul);
+    }();
+    return c;
+  }
+  /**
+   * Vocabulary rows per backward chunk. The backward product reduces over
+   * the chunk, and the DSP matmul needs the padded activation tile
+   * (rows x chunk FP16) to fit its 8 MB of VTCM, so this is much smaller than
+   * the forward chunk (32768 failed to solve for more than 32 rows).
+   */
+  static unsigned int ntBackChunk() {
+    static const unsigned int c = [] {
+      const char *v = std::getenv("NNTR_HEXAGON_NT_BCHUNK");
+      const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 8192ul;
+      return static_cast<unsigned int>(n >= 32 ? (n / 32) * 32 : 8192ul);
+    }();
+    return c;
+  }
+  static bool ntCheck() {
+    static const bool on = std::getenv("NNTR_HEXAGON_NT_CHECK") != nullptr;
+    return on;
+  }
+  /** first call only: compare the DSP result with the CPU on a few rows */
+  void ntCheckForward(Tensor &input, Tensor &weight, Tensor &output,
+                      unsigned int M, unsigned int K, unsigned int N) {
+    if (nt_checked_fwd_++)
+      return;
+    const unsigned int m = std::min(M, 2u);
+    std::vector<float> ref(static_cast<size_t>(m) * N);
+    cpu_->sgemm_fp32(0, false, true, m, N, K, 1.0f, input.getData<float>(), K,
+                     weight.getData<float>(), K, 0.0f, ref.data(), N);
+    double maxerr = 0, maxref = 0;
+    const float *o = output.getData<float>();
+    for (size_t i = 0; i < ref.size(); ++i) {
+      maxerr = std::max(maxerr, static_cast<double>(std::fabs(o[i] - ref[i])));
+      maxref = std::max(maxref, static_cast<double>(std::fabs(ref[i])));
+    }
+    ml_logi("HexagonComputeOps NT check fwd: M=%u N=%u K=%u max|err|=%.5g "
+            "max|ref|=%.5g",
+            M, N, K, maxerr, maxref);
+  }
+  void ntCheckBackward(const Tensor &dy, Tensor &weight, Tensor &dx,
+                       unsigned int M, unsigned int K, unsigned int N) {
+    if (nt_checked_bwd_++)
+      return;
+    const unsigned int m = std::min(M, 2u);
+    std::vector<float> ref(static_cast<size_t>(m) * K);
+    cpu_->sgemm_fp32(0, false, false, m, K, N, 1.0f, dy.getData<float>(), N,
+                     weight.getData<float>(), K, 0.0f, ref.data(), K);
+    double maxerr = 0, maxref = 0;
+    const float *o = dx.getData<float>();
+    for (size_t i = 0; i < ref.size(); ++i) {
+      maxerr = std::max(maxerr, static_cast<double>(std::fabs(o[i] - ref[i])));
+      maxref = std::max(maxref, static_cast<double>(std::fabs(ref[i])));
+    }
+    ml_logi("HexagonComputeOps NT check bwd: M=%u N=%u K=%u max|err|=%.5g "
+            "max|ref|=%.5g",
+            M, N, K, maxerr, maxref);
   }
 
   bool overflowed(const void *key) {
@@ -319,6 +535,9 @@ private:
   std::unordered_set<const void *> uploaded_;     /**< q4x4x2 on the DSP */
   std::unordered_set<const void *> f16_resident_; /**< FP16 copy on the DSP */
   std::unordered_set<const void *> overflowed_; /**< forward left FP16 range */
+  std::mutex nt_mtx_;
+  std::vector<float> nt_tmp_, nt_out_; /**< chunk staging for the NT ops */
+  int nt_checked_fwd_ = 0, nt_checked_bwd_ = 0;
   std::vector<uint8_t> unpack_scratch_;
   std::vector<uint8_t> htp_scratch_;
 };
