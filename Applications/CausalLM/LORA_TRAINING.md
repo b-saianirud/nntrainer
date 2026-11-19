@@ -524,9 +524,10 @@ test it introduces passes at that point in history):
 
 ## Running on the Hexagon NPU
 
-The frozen Q4_0 base matmuls (forward and input gradient), the large FP32
+The frozen Q4_0 base matmuls (forward and input gradient), the tied lm_head
+projection (forward and input gradient, in vocabulary chunks), the large FP32
 GEMMs and the attention forward/backward run on the Hexagon DSP (HMX/HVX);
-the small LoRA matmuls, norms, RoPE and the optimizer stay on the CPU. The
+the small LoRA matmuls, norms, RoPE, the loss and the optimizer stay on the CPU. The
 trained adapter is the same FP32 `loraA` / `loraB` file the CPU produces.
 
 Build (Android, meson):
@@ -548,6 +549,20 @@ export LD_LIBRARY_PATH=. NNTR_USE_HEXAGON_CDSP=1
 ./nntr_lora_train <model_dir> <train_data.txt> --full_seq_loss --eos_id <id> \
     --batch_size 4 --seq_len 96 --lora_rank 32 --lora_alpha 64 --lr 1e-4
 ```
+
+CPU threads: the CPU side of a step (LoRA matmuls, attention backward, loss,
+SwiGLU, Adam) is a large share of the NPU step time. The Android build script
+passes `-Dopenblas-num-threads=1`, and `NNTR_NUM_THREADS` does not change that
+(it sizes nntrainer's own thread pool, not OpenBLAS), so the CPU matmuls use a
+single core unless the build is configured otherwise:
+
+```bash
+./build_android.sh -Denable-hexagon-cdsp=true -Dopenblas-num-threads=4
+```
+
+On a Snapdragon 8 Elite Gen 5 phone this took a 12-step LoRA step from 3.28 s to
+2.81 s (batch 4, seq 96, rank 32). It also runs the phone about 8 C hotter, which
+matters for long runs.
 
 Limits: the bridge takes at most 1024 activation rows (`batch_size * seq_len`)
 per matmul and falls back to the CPU beyond that.
