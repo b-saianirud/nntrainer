@@ -22,7 +22,9 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cpu_ops_table.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +95,14 @@ void tie_emb_stage_h2d_wait() {
 #endif
 
 namespace nntrainer {
+
+namespace {
+/** the engine's ops table (CPU table when the layer carries none) */
+nntrainer::ComputeOps *trainOps(nntrainer::RunLayerContext &context) {
+  nntrainer::ComputeOps *ops = context.getComputeOps();
+  return ops != nullptr ? ops : nntrainer::get_cpu_ops();
+}
+} // namespace
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -391,7 +401,7 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
         in_dim_b, b * input_dim.getFeatureLen(), true);
       nntrainer::Tensor out_b = hidden_.getSharedDataTensor(
         out_dim_b, b * hidden_dim.getFeatureLen(), true);
-      in_b.dot(weight, out_b, false, true);
+      trainOps(context)->fc_frozen_nt(in_b, weight, out_b);
     }
     return;
   }
@@ -1071,7 +1081,7 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
         dx.getSharedDataTensor(dx_dim_b, b * input_dim.getFeatureLen(), true);
       nntrainer::Tensor dy_b =
         dy.getSharedDataTensor(dy_dim_b, b * dy_dim.getFeatureLen(), true);
-      dy_b.dot(weight, dx_b, false, false);
+      trainOps(context)->fc_frozen_nt_dgrad(dy_b, weight, dx_b);
     }
     return;
   }
