@@ -106,6 +106,35 @@ void Adam::applyGradient(RunOptimizerContext &context) {
   Tensor &wm = context.getOptimizerVariable(AdamParams::wm);
   Tensor &wv = context.getOptimizerVariable(AdamParams::wv);
 
+  if (!torch_ref && wm.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      wv.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      x_grad.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      wm.size() == x_grad.size() && wv.size() == x_grad.size()) {
+    // Same arithmetic as the tensor ops below (update m and v, then
+    // m / (sqrt(v) + eps)), fused into one pass over the weight instead of
+    // about seven passes with a std::function call per element.
+    float *g = x_grad.getData<float>();
+    float *m = wm.getData<float>();
+    float *v = wv.getData<float>();
+    const float b1c = 1.0f - beta1;
+    const float b2c = 1.0f - beta2;
+    const size_t n = x_grad.size();
+    for (size_t i = 0; i < n; ++i) {
+      const float gi = g[i];
+      const float mi = m[i] * beta1 + gi * b1c;
+      const float vi = v[i] * beta2 + gi * gi * b2c;
+      m[i] = mi;
+      v[i] = vi;
+      g[i] = static_cast<float>(1.0 / (std::sqrt(static_cast<double>(vi)) +
+                                       static_cast<double>(epsilon))) *
+             mi;
+    }
+    context.applyGradient(
+      getUpdatedLearningRate(context.getIteration(), context.getLearningRate()),
+      x_grad);
+    return;
+  }
+
   wm.multiply_i(beta1);
   wm.add_i(x_grad, 1.0f - beta1);
 
