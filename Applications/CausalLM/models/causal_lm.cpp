@@ -894,7 +894,11 @@ Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
   if (LORA_RANK > 0)
     lmhead_prop.emplace_back(withKey("trainable", "false"));
 
-  LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
+  // On the NPU the full-sequence projection runs through the htp ops table
+  // (fc_frozen_nt); the layer must be created under that context to get it.
+  const bool lmhead_on_npu = FOR_TRAINING && FULL_SEQ_LOSS && !lmhead_untied;
+  LayerHandle lmhead(createLayer(
+    lmhead_type, lmhead_on_npu ? withHexagonEngine(lmhead_prop) : lmhead_prop));
   return lmhead(h);
 }
 
