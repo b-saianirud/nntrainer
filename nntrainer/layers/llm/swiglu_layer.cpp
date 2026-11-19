@@ -14,12 +14,14 @@
 
 #include "swiglu_layer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 #include <tensor.h>
+#include <thread_manager.h>
 
 namespace nntrainer {
 
@@ -166,18 +168,26 @@ void SwiGLULayer::calcDerivative(RunLayerContext &context) {
   float *dg = d_gate.getData<float>();
   float *du = d_up.getData<float>();
 
-  for (size_t i = 0; i < len; ++i) {
-    const float gi = g[i];
-    const float ui = u[i];
-    const float dyi = dy_[i];
+  // Element-wise and independent per index (gate/up are the private caches, so
+  // the outgoing buffers cannot alias what is read), hence safe to split.
+  constexpr size_t kChunk = 16384;
+  const size_t chunks = (len + kChunk - 1) / kChunk;
+  ThreadManager::Global().parallel_for(0, chunks, [&](size_t c) {
+    const size_t lo = c * kChunk;
+    const size_t hi = std::min(len, lo + kChunk);
+    for (size_t i = lo; i < hi; ++i) {
+      const float gi = g[i];
+      const float ui = u[i];
+      const float dyi = dy_[i];
 
-    const float sig = 1.0f / (1.0f + std::exp(-gi));
-    const float silu = gi * sig;
-    const float dsilu = sig * (1.0f + gi * (1.0f - sig));
+      const float sig = 1.0f / (1.0f + std::exp(-gi));
+      const float silu = gi * sig;
+      const float dsilu = sig * (1.0f + gi * (1.0f - sig));
 
-    du[i] = dyi * silu;
-    dg[i] = dyi * ui * dsilu;
-  }
+      du[i] = dyi * silu;
+      dg[i] = dyi * ui * dsilu;
+    }
+  });
 }
 
 } // namespace nntrainer

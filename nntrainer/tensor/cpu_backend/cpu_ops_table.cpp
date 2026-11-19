@@ -16,7 +16,9 @@
  * dispatch picks the right symbol at link time.
  */
 
+#include <algorithm>
 #include <cpu_ops_table.h>
+#include <thread_manager.h>
 
 #include <cmath>
 #include <cstring>
@@ -88,8 +90,21 @@ void elementwise2_rows(const Tensor &in1, const Tensor &in2, Tensor &out,
     const float *a = in1.getData<float>() + elem_off;
     const float *b = in2.getData<float>() + elem_off;
     float *o = out.getData<float>() + elem_off;
-    for (size_t i = 0; i < n; ++i)
-      o[i] = op(a[i], b[i]);
+    // Large training tensors are split across the compute threads; the
+    // decode-sized ones are not worth the hand-off.
+    constexpr size_t kChunk = 16384;
+    if (n >= 4 * kChunk) {
+      const size_t chunks = (n + kChunk - 1) / kChunk;
+      ThreadManager::Global().parallel_for(0, chunks, [&](size_t c) {
+        const size_t lo = c * kChunk;
+        const size_t hi = std::min(n, lo + kChunk);
+        for (size_t i = lo; i < hi; ++i)
+          o[i] = op(a[i], b[i]);
+      });
+    } else {
+      for (size_t i = 0; i < n; ++i)
+        o[i] = op(a[i], b[i]);
+    }
     break;
   }
 #ifdef ENABLE_FP16
