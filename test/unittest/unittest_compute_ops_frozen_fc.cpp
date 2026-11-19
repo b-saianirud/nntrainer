@@ -111,6 +111,48 @@ TEST(ComputeOpsFrozenFc, floatWeightPassesThrough_p) {
     ASSERT_FLOAT_EQ(y.getData<float>()[i], ref.getData<float>()[i]);
 }
 
+/**
+ * @brief fc_frozen_nt: weight stored [out x in] (tied embedding), y = x * W^T
+ */
+TEST(ComputeOpsFrozenFc, transposedLayoutForward_p) {
+  nntrainer::init_backend();
+  nntrainer::Tensor w(1, 1, N, K,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  w.setRandNormal(0.0f, 0.05f);
+  nntrainer::Tensor x(B, 1, H, K,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  x.setRandNormal(0.0f, 1.0f);
+  nntrainer::Tensor y(B, 1, H, N,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+
+  nntrainer::get_cpu_ops()->fc_frozen_nt(x, w, y);
+
+  nntrainer::Tensor ref = x.dot(w, false, true);
+  for (unsigned int i = 0; i < B * H * N; ++i)
+    ASSERT_FLOAT_EQ(y.getData<float>()[i], ref.getData<float>()[i]);
+}
+
+/**
+ * @brief fc_frozen_nt_dgrad: dx = dy * W for the [out x in] layout
+ */
+TEST(ComputeOpsFrozenFc, transposedLayoutDgrad_p) {
+  nntrainer::init_backend();
+  nntrainer::Tensor w(1, 1, N, K,
+                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  w.setRandNormal(0.0f, 0.05f);
+  nntrainer::Tensor dy(B, 1, H, N,
+                       {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  dy.setRandNormal(0.0f, 1.0f);
+  nntrainer::Tensor dx(B, 1, H, K,
+                       {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+
+  nntrainer::get_cpu_ops()->fc_frozen_nt_dgrad(dy, w, dx);
+
+  nntrainer::Tensor ref = dy.dot(w);
+  for (unsigned int i = 0; i < B * H * K; ++i)
+    ASSERT_FLOAT_EQ(dx.getData<float>()[i], ref.getData<float>()[i]);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

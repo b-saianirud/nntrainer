@@ -415,6 +415,9 @@ public:
   void fc_frozen(Tensor &input, Tensor &weight, Tensor &output) override;
   // dx = dy * dequantize(weight)^T at the activation dtype.
   void fc_frozen_dgrad(const Tensor &dy, Tensor &weight, Tensor &dx) override;
+  void fc_frozen_nt(Tensor &input, Tensor &weight, Tensor &output) override;
+  void fc_frozen_nt_dgrad(const Tensor &dy, Tensor &weight,
+                          Tensor &dx) override;
   // In-place whole-tensor activation, expressed via activation() above.
   void apply_activation(Tensor &out, int act_type) override;
   // Host row reductions, expressed in terms of the very Tensor calls their

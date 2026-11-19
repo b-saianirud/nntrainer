@@ -377,6 +377,16 @@ void CpuComputeOps::fc_frozen_dgrad(const Tensor &dy, Tensor &weight,
   dx.dot_deriv_wrt_1(w, dy, false, false);
 }
 
+void CpuComputeOps::fc_frozen_nt(Tensor &input, Tensor &weight,
+                                 Tensor &output) {
+  input.dot(weight, output, false, true);
+}
+
+void CpuComputeOps::fc_frozen_nt_dgrad(const Tensor &dy, Tensor &weight,
+                                       Tensor &dx) {
+  dy.dot(weight, dx, false, false);
+}
+
 void CpuComputeOps::apply_activation(Tensor &out, int act_type) {
   if (static_cast<ActivationType>(act_type) == ActivationType::ACT_NONE)
     return;

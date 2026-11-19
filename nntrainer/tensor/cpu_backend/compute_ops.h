@@ -576,6 +576,21 @@ public:
   virtual void fc_frozen_dgrad(const Tensor &dy, Tensor &weight, Tensor &dx);
 
   /**
+   * @brief Projection through a frozen weight stored [out x in] (the layout
+   *        of a tied embedding / lm_head): output = input * weight^T.
+   *
+   * @details Same contract as fc_frozen() but for a weight whose rows are the
+   * output features, so no transpose is materialized. The weight is FP32 and
+   * is never updated.
+   */
+  virtual void fc_frozen_nt(Tensor &input, Tensor &weight, Tensor &output);
+
+  /**
+   * @brief Input gradient of fc_frozen_nt(): dx = dy * weight.
+   */
+  virtual void fc_frozen_nt_dgrad(const Tensor &dy, Tensor &weight, Tensor &dx);
+
+  /**
    * @brief Optional one-time weight transform at load time, e.g. an
    *        accelerator repack. Default no-op; called from the layer's read()
    *        once the weights are in memory.
