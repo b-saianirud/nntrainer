@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <thread_manager.h>
+#include <vector>
 
 #include "causal_lm_loss.h"
 
@@ -75,30 +77,42 @@ void CausalLMLossLayer::forwarding(nntrainer::RunLayerContext &context,
   const float *y = label.getData<float>();
   float *nll = out.getData<float>();
 
+  // Rows are independent; compute them in parallel and reduce serially in
+  // row order so the total is identical to the single-threaded sum.
+  const size_t rows = static_cast<size_t>(batch) * seq;
+  std::vector<unsigned int> rank(training ? 0 : rows, 0);
+  nntrainer::ThreadManager::Global().parallel_for(0, rows, [&](size_t r) {
+    const unsigned int b = static_cast<unsigned int>(r / seq);
+    const unsigned int s = static_cast<unsigned int>(r % seq);
+    const int t = targetOf(y + static_cast<size_t>(b) * seq, s, vocab);
+    if (t < 0)
+      return;
+    const float *row = x + r * vocab;
+    nll[r] = logSumExp(row, vocab) - row[t];
+    if (!training) {
+      // Rank of the target = number of logits strictly above it.
+      unsigned int k = 0;
+      for (unsigned int v = 0; v < vocab; ++v)
+        k += row[v] > row[t];
+      rank[r] = k;
+    }
+  });
+
   double total = 0.0;
   size_t count = 0;
-  for (unsigned int b = 0; b < batch; ++b) {
-    const float *y_b = y + static_cast<size_t>(b) * seq;
-    for (unsigned int s = 0; s < seq; ++s) {
-      const int t = targetOf(y_b, s, vocab);
-      if (t < 0)
-        continue;
-      const float *row = x + (static_cast<size_t>(b) * seq + s) * vocab;
-      const float l = logSumExp(row, vocab) - row[t];
-      nll[static_cast<size_t>(b) * seq + s] = l;
-      total += l;
-      ++count;
-      if (!training) {
-        // Rank of the target = number of logits strictly above it.
-        unsigned int rank = 0;
-        for (unsigned int v = 0; v < vocab; ++v)
-          rank += row[v] > row[t];
-        auto &st = g_causal_lm_eval_stats;
-        st.nll += l;
-        ++st.tokens;
-        st.top1 += rank < 1;
-        st.top5 += rank < 5;
-      }
+  for (size_t r = 0; r < rows; ++r) {
+    const unsigned int b = static_cast<unsigned int>(r / seq);
+    const unsigned int s = static_cast<unsigned int>(r % seq);
+    if (targetOf(y + static_cast<size_t>(b) * seq, s, vocab) < 0)
+      continue;
+    total += nll[r];
+    ++count;
+    if (!training) {
+      auto &st = g_causal_lm_eval_stats;
+      st.nll += nll[r];
+      ++st.tokens;
+      st.top1 += rank[r] < 1;
+      st.top5 += rank[r] < 5;
     }
   }
   context.setLoss(count ? static_cast<float>(total / count) : 0.0f);
@@ -128,23 +142,23 @@ void CausalLMLossLayer::calcDerivative(nntrainer::RunLayerContext &context) {
         ++count;
   const float inv_n = count ? 1.0f / static_cast<float>(count) : 0.0f;
 
-  for (unsigned int b = 0; b < batch; ++b) {
-    const float *y_b = y + static_cast<size_t>(b) * seq;
-    for (unsigned int s = 0; s < seq; ++s) {
-      const int t = targetOf(y_b, s, vocab);
-      const size_t off = (static_cast<size_t>(b) * seq + s) * vocab;
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, static_cast<size_t>(batch) * seq, [&](size_t r) {
+      const unsigned int b = static_cast<unsigned int>(r / seq);
+      const unsigned int s = static_cast<unsigned int>(r % seq);
+      const int t = targetOf(y + static_cast<size_t>(b) * seq, s, vocab);
+      const size_t off = r * vocab;
       const float *row = x + off;
       float *grow = g + off;
       if (t < 0) {
         std::fill(grow, grow + vocab, 0.0f);
-        continue;
+        return;
       }
       const float lse = logSumExp(row, vocab);
       for (unsigned int v = 0; v < vocab; ++v)
         grow[v] = std::exp(row[v] - lse) * inv_n;
       grow[t] -= inv_n;
-    }
-  }
+    });
 }
 
 void CausalLMLossLayer::setProperty(const std::vector<std::string> &values) {
